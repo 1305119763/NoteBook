@@ -1,0 +1,37 @@
+{
+  "name": "notebook",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:tauri": "env -u CI tauri dev",
+    "build": "vue-tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "build:mac": "npm run build && env -u CI tauri build",
+    "icons:normalize": "node scripts/normalize-icon-alpha.mjs",
+    "icons:rebuild:raw": "node scripts/rebuild-icons.mjs",
+    "icons:rebuild": "node scripts/normalize-icon-alpha.mjs && node scripts/rebuild-icons.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "@tiptap/extension-placeholder": "^3.20.4",
+    "@tiptap/pm": "^3.20.4",
+    "@tiptap/starter-kit": "^3.20.4",
+    "@tiptap/vue-3": "^3.20.4",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "pngjs": "^7.0.0",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3",
+    "vue-tsc": "^2.1.10"
+  }
+}
