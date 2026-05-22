@@ -1,4 +1,5 @@
 mod db;
+mod media;
 
 use std::sync::Mutex;
 use tauri::{Manager, State};
@@ -147,17 +148,92 @@ fn delete_entry(state: State<DbState>, id: String, note_id: String) -> Result<()
 }
 
 #[tauri::command]
+fn import_media_file(_state: State<DbState>, file_path: String) -> Result<media::ImportedMedia, String> {
+    media::import_media_from_path(&file_path)
+}
+
+#[tauri::command]
+fn import_media_bytes(_state: State<DbState>, data: Vec<u8>, extension: String) -> Result<media::ImportedMedia, String> {
+    media::import_media_bytes(data, extension)
+}
+
+#[tauri::command]
 fn export_tbook(state: State<DbState>, path: String) -> Result<(), String> {
+    use std::path::Path;
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     let bytes = db::export_snapshot(&conn)?;
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+
+    // 收集所有笔记中的媒体引用，导出同名媒体文件夹
+    let media_keys = media::collect_all_media_keys(&conn)?;
+    if !media_keys.is_empty() {
+        let tbook_path = Path::new(&path);
+        let parent = tbook_path.parent().unwrap_or(Path::new("."));
+        let stem = tbook_path.file_stem().unwrap_or_default().to_string_lossy();
+        let media_export_dir = parent.join(format!("{}.media", stem));
+
+        // 清理旧目录并重建
+        if media_export_dir.exists() {
+            std::fs::remove_dir_all(&media_export_dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::create_dir_all(&media_export_dir).map_err(|e| e.to_string())?;
+
+        // 复制媒体文件到导出目录
+        let media_dir = media::media_dir()?;
+        let mut bindings: Vec<media::MediaBinding> = Vec::new();
+        for key in &media_keys {
+            let src = media_dir.join(key);
+            let dest = media_export_dir.join(key);
+            if src.is_file() {
+                std::fs::copy(&src, &dest).map_err(|e| e.to_string())?;
+                bindings.push(media::MediaBinding {
+                    storage_key: key.clone(),
+                    note_ids: vec![], // 绑定信息已存在于 HTML 中，此处仅记录文件
+                });
+            }
+        }
+
+        // 写入绑定清单
+        let manifest_path = media_export_dir.join("media_manifest.json");
+        let manifest = media::MediaExportManifest {
+            version: "1.0.0".to_string(),
+            bindings,
+        };
+        let manifest_json = serde_json::to_string_pretty(&manifest).map_err(|e| e.to_string())?;
+        std::fs::write(&manifest_path, manifest_json).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn import_tbook(state: State<DbState>, path: String) -> Result<(), String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    use std::path::Path;
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let conn = state.0.lock().map_err(|e| e.to_string())?;
-    db::import_replace(&conn, &bytes)
+    db::import_replace(&conn, &bytes)?;
+
+    // 导入同名媒体文件夹
+    let tbook_path = Path::new(&path);
+    let parent = tbook_path.parent().unwrap_or(Path::new("."));
+    let stem = tbook_path.file_stem().unwrap_or_default().to_string_lossy();
+    let media_import_dir = parent.join(format!("{}.media", stem));
+
+    if media_import_dir.exists() && media_import_dir.is_dir() {
+        // 复制媒体文件到应用数据目录，但不绑定（已通过HTML引用绑定）
+        for entry in std::fs::read_dir(&media_import_dir).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                    if file_name != "media_manifest.json" {
+                        let dest = media::media_dir()?.join(file_name);
+                        std::fs::copy(&path, &dest).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -191,6 +267,8 @@ pub fn run() {
             delete_entry,
             export_tbook,
             import_tbook,
+            import_media_file,
+            import_media_bytes,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

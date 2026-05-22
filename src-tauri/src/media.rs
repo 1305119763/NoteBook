@@ -1,12 +1,12 @@
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub const MEDIA_SCHEME: &str = "notebook-media://";
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportedMedia {
     /// 存于应用 media 目录下的文件名，如 `a1b2.png`
@@ -15,6 +15,24 @@ pub struct ImportedMedia {
     pub absolute_path: String,
     /// 写入 HTML 的 src，形如 notebook-media://a1b2.png
     pub media_src: String,
+}
+
+/// 媒体文件与笔记的绑定关系
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaBinding {
+    /// 存于 media 目录下的文件名
+    pub storage_key: String,
+    /// 引用此媒体的笔记 ID 列表（导入恢复时使用）
+    pub note_ids: Vec<String>,
+}
+
+/// 媒体导出清单
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaExportManifest {
+    pub version: String,
+    pub bindings: Vec<MediaBinding>,
 }
 
 pub fn app_data_dir() -> Result<PathBuf, String> {

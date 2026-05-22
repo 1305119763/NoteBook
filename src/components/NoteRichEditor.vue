@@ -1,8 +1,12 @@
 <script setup lang="ts">
-import { onBeforeUnmount, watch } from "vue";
+import { onBeforeUnmount, ref, watch } from "vue";
 import { EditorContent, useEditor } from "@tiptap/vue-3";
 import Placeholder from "@tiptap/extension-placeholder";
 import StarterKit from "@tiptap/starter-kit";
+import Image from "@tiptap/extension-image";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { Video } from "../extensions/Video";
 
 const props = defineProps<{
   modelValue: string;
@@ -13,6 +17,8 @@ const emit = defineEmits<{
   "update:modelValue": [string];
 }>();
 
+const isImporting = ref(false);
+
 const editor = useEditor({
   extensions: [
     StarterKit.configure({
@@ -21,12 +27,45 @@ const editor = useEditor({
     Placeholder.configure({
       placeholder: "在此处输入正文…",
     }),
+    Image.configure({
+      allowBase64: false,
+      HTMLAttributes: {
+        class: "notebook-inline-media",
+      },
+    }),
+    Video,
   ],
   content: props.modelValue?.trim() ? props.modelValue : "<p></p>",
   editable: props.editable,
   editorProps: {
     attributes: {
       class: "note-editor-prosemirror",
+    },
+    handleDrop: (view, event, slice, moved) => {
+      if (!event.dataTransfer || !props.editable) return false;
+      const files = event.dataTransfer.files;
+      if (files.length > 0) {
+        handleFiles(Array.from(files));
+        return true;
+      }
+      return false;
+    },
+    handlePaste: (view, event) => {
+      if (!event.clipboardData || !props.editable) return false;
+      const items = event.clipboardData.items;
+      const files: File[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === "file") {
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      }
+      if (files.length > 0) {
+        handleFiles(files);
+        return true;
+      }
+      return false;
     },
   },
   onUpdate: ({ editor: ed }) => {
@@ -56,8 +95,95 @@ onBeforeUnmount(() => {
   editor.value?.destroy();
 });
 
+async function handleFiles(files: File[]) {
+  const ed = editor.value;
+  if (!ed) return;
+  isImporting.value = true;
+
+  const ALLOWED_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "svg", "mp4", "webm", "mov"];
+
+  for (const file of files) {
+    const extFromName = file.name.split(".").pop()?.toLowerCase() || "";
+    const extFromType = file.type.split("/").pop()?.toLowerCase() || "";
+    // 优先使用文件名扩展名，若无效则从 MIME 类型推断（覆盖粘贴截图等文件名缺失场景）
+    const ext = ALLOWED_EXTS.includes(extFromName) ? extFromName : extFromType;
+    const isImage = ["jpg", "jpeg", "png", "gif", "webp", "svg"].includes(ext);
+    const isVideo = ["mp4", "webm", "mov"].includes(ext);
+    if (!isImage && !isVideo) continue;
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const result = await invoke("import_media_bytes", {
+        data: Array.from(new Uint8Array(buffer)),
+        extension: ext,
+      }) as { mediaSrc: string; storageKey: string; absolutePath: string };
+
+      if (isImage) {
+        ed.chain().focus().setImage({ src: convertFileSrc(result.absolutePath) }).run();
+      } else {
+        ed.chain().focus().setVideo({ src: convertFileSrc(result.absolutePath) }).run();
+      }
+    } catch (e) {
+      console.error("媒体导入失败:", e);
+    }
+  }
+  isImporting.value = false;
+}
+
+async function pickAndImportImage() {
+  const selected = await open({
+    multiple: true,
+    filters: [{
+      name: "图片",
+      extensions: ["jpg", "jpeg", "png", "gif", "webp", "svg"],
+    }],
+  });
+  if (!selected) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  await importFromPaths(paths);
+}
+
+async function pickAndImportVideo() {
+  const selected = await open({
+    multiple: true,
+    filters: [{
+      name: "视频",
+      extensions: ["mp4", "webm", "mov"],
+    }],
+  });
+  if (!selected) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  await importFromPaths(paths);
+}
+
+async function importFromPaths(paths: string[]) {
+  const ed = editor.value;
+  if (!ed) return;
+  isImporting.value = true;
+
+  for (const filePath of paths) {
+    try {
+      const result = await invoke("import_media_file", {
+        filePath,
+      }) as { mediaSrc: string; storageKey: string; absolutePath: string };
+
+      const ext = filePath.split(".").pop()?.toLowerCase() || "";
+      const isImage = ["jpg", "jpeg", "png", "gif", "webp", "svg"].includes(ext);
+
+      if (isImage) {
+        ed.chain().focus().setImage({ src: convertFileSrc(result.absolutePath) }).run();
+      } else {
+        ed.chain().focus().setVideo({ src: convertFileSrc(result.absolutePath) }).run();
+      }
+    } catch (e) {
+      console.error("媒体导入失败:", e);
+    }
+  }
+  isImporting.value = false;
+}
+
 function tbDisabled(): boolean {
-  return !props.editable || !editor.value;
+  return !props.editable || !editor.value || isImporting.value;
 }
 </script>
 
@@ -145,6 +271,25 @@ function tbDisabled(): boolean {
         @click="editor?.chain().focus().toggleBlockquote().run()"
       >
         引用
+      </button>
+      <span class="rte-tb-sep" />
+      <button
+        type="button"
+        class="rte-tb-btn"
+        :disabled="tbDisabled()"
+        title="导入图片"
+        @click="pickAndImportImage"
+      >
+        📷
+      </button>
+      <button
+        type="button"
+        class="rte-tb-btn"
+        :disabled="tbDisabled()"
+        title="导入视频"
+        @click="pickAndImportVideo"
+      >
+        🎥
       </button>
       <span class="rte-tb-sep" />
       <button
@@ -310,5 +455,20 @@ function tbDisabled(): boolean {
   float: left;
   height: 0;
   pointer-events: none;
+}
+
+:deep(.note-editor-prosemirror img.notebook-inline-media) {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  margin: 8px 0;
+  display: block;
+}
+
+
+
+:deep(.note-editor-prosemirror .ProseMirror-selectednode) {
+  outline: 2px solid var(--accent, #007aff);
+  border-radius: 8px;
 }
 </style>
