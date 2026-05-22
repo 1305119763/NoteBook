@@ -54,9 +54,17 @@ npm run dev:tauri
 # 类型检查 + 前端生产构建
 npm run build
 
-# 打包桌面应用（macOS 示例）
+# 打包桌面应用（macOS）
 npm run build:mac
+
+# 打包桌面应用（Windows，需在 Windows 系统上运行）
+npm run build:win
 ```
+
+**Windows 构建说明**：
+- 在 Windows 系统上可直接运行 `npm run build:win`
+- 在 macOS/Linux 上需要使用 GitHub Actions 或 Docker 交叉编译
+- 详细构建指南见 [BUILD_WINDOWS.md](./BUILD_WINDOWS.md)
 
 ### 应用图标
 

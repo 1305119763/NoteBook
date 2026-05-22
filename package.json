@@ -1,7 +1,7 @@
 {
   "name": "notebook",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.1.0",
   "engines": {
     "node": ">=20.0.0"
   },
@@ -13,6 +13,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:mac": "npm run build && env -u CI tauri build",
+    "build:win": "npm run build && tauri build --target x86_64-pc-windows-msvc",
     "icons:normalize": "node scripts/normalize-icon-alpha.mjs",
     "icons:rebuild:raw": "node scripts/rebuild-icons.mjs",
     "icons:rebuild": "node scripts/normalize-icon-alpha.mjs && node scripts/rebuild-icons.mjs"
@@ -20,6 +21,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
+    "@tiptap/extension-image": "^3.23.5",
     "@tiptap/extension-placeholder": "^3.20.4",
     "@tiptap/pm": "^3.20.4",
     "@tiptap/starter-kit": "^3.20.4",
