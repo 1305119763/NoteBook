@@ -1,10 +1,14 @@
 <script setup lang="ts">
-import { onBeforeUnmount, ref, watch } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { EditorContent, useEditor } from "@tiptap/vue-3";
 import Placeholder from "@tiptap/extension-placeholder";
 import StarterKit from "@tiptap/starter-kit";
 import Image from "@tiptap/extension-image";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Video } from "../extensions/Video";
 
@@ -18,6 +22,248 @@ const emit = defineEmits<{
 }>();
 
 const isImporting = ref(false);
+
+const ALLOWED_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "svg"];
+const ALLOWED_VIDEO_EXTS = ["mp4", "webm", "mov"];
+const ALLOWED_EXTS = [...ALLOWED_IMAGE_EXTS, ...ALLOWED_VIDEO_EXTS];
+
+const dragOverlayVisible = ref(false);
+const dragPreviewUrl = ref<string | null>(null);
+const dragPreviewLabel = ref("");
+const dragPreviewKind = ref<"image" | "video" | "media">("image");
+const dragDepth = ref(0);
+const editorDropZoneRef = ref<HTMLElement | null>(null);
+let dragPreviewObjectUrl: string | null = null;
+let dropHandledAt = 0;
+let unlistenTauriDragDrop: UnlistenFn | null = null;
+let windowScaleFactor = 1;
+
+function revokeDragPreviewUrl() {
+  if (dragPreviewObjectUrl) {
+    URL.revokeObjectURL(dragPreviewObjectUrl);
+    dragPreviewObjectUrl = null;
+  }
+  dragPreviewUrl.value = null;
+}
+
+function basename(path: string): string {
+  return path.split(/[/\\]/).pop() || path;
+}
+
+function isMediaPath(path: string): boolean {
+  const ext = basename(path).split(".").pop()?.toLowerCase() || "";
+  return ALLOWED_EXTS.includes(ext);
+}
+
+function mediaPathsFromStrings(paths: string[]): string[] {
+  return paths.filter(isMediaPath);
+}
+
+function classifyFile(file: File): { ext: string; isImage: boolean; isVideo: boolean } | null {
+  const extFromName = file.name.split(".").pop()?.toLowerCase() || "";
+  const extFromType = file.type.split("/").pop()?.toLowerCase() || "";
+  const ext = ALLOWED_EXTS.includes(extFromName) ? extFromName : extFromType;
+  const isImage = ALLOWED_IMAGE_EXTS.includes(ext);
+  const isVideo = ALLOWED_VIDEO_EXTS.includes(ext);
+  if (!isImage && !isVideo) return null;
+  return { ext, isImage, isVideo };
+}
+
+function filesFromDataTransfer(dt: DataTransfer): File[] {
+  const fromList = Array.from(dt.files);
+  if (fromList.length > 0) return fromList;
+  const out: File[] = [];
+  for (let i = 0; i < dt.items.length; i++) {
+    const item = dt.items[i];
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file) out.push(file);
+  }
+  return out;
+}
+
+function mediaFilesFromDataTransfer(dt: DataTransfer): File[] {
+  return filesFromDataTransfer(dt).filter((f) => classifyFile(f) !== null);
+}
+
+function hasMediaPayload(dt: DataTransfer): boolean {
+  if (mediaFilesFromDataTransfer(dt).length > 0) return true;
+  for (let i = 0; i < dt.types.length; i++) {
+    const t = dt.types[i];
+    if (t === "Files" || t.startsWith("image/") || t.startsWith("video/")) return true;
+  }
+  return false;
+}
+
+function updateDragPreviewFromPaths(paths: string[]) {
+  if (paths.length === 0) {
+    dragPreviewLabel.value = "拖放图片或视频到此处";
+    dragPreviewKind.value = "media";
+    revokeDragPreviewUrl();
+    return;
+  }
+  const first = paths[0];
+  const ext = basename(first).split(".").pop()?.toLowerCase() || "";
+  dragPreviewLabel.value =
+    paths.length > 1 ? `${basename(first)} 等 ${paths.length} 个文件` : basename(first);
+  dragPreviewKind.value = ALLOWED_VIDEO_EXTS.includes(ext) ? "video" : "image";
+  if (ALLOWED_IMAGE_EXTS.includes(ext)) {
+    revokeDragPreviewUrl();
+    dragPreviewUrl.value = convertFileSrc(first);
+  } else {
+    revokeDragPreviewUrl();
+  }
+}
+
+function updateDragPreview(dt: DataTransfer) {
+  const media = mediaFilesFromDataTransfer(dt);
+  if (media.length === 0) {
+    dragPreviewLabel.value = "拖放图片或视频到此处";
+    dragPreviewKind.value = "media";
+    revokeDragPreviewUrl();
+    return;
+  }
+  const first = media[0];
+  const kind = classifyFile(first);
+  dragPreviewLabel.value =
+    media.length > 1
+      ? `${first.name} 等 ${media.length} 个文件`
+      : first.name || (kind?.isVideo ? "视频" : "图片");
+  dragPreviewKind.value = kind?.isVideo ? "video" : "image";
+  if (kind?.isImage && first.type.startsWith("image/")) {
+    if (dragPreviewObjectUrl) URL.revokeObjectURL(dragPreviewObjectUrl);
+    dragPreviewObjectUrl = URL.createObjectURL(first);
+    dragPreviewUrl.value = dragPreviewObjectUrl;
+  } else {
+    revokeDragPreviewUrl();
+  }
+}
+
+function clearDragOverlay() {
+  dragDepth.value = 0;
+  dragOverlayVisible.value = false;
+  dragPreviewLabel.value = "";
+  revokeDragPreviewUrl();
+}
+
+function onEditorDragEnter(e: DragEvent) {
+  if (!props.editable || !e.dataTransfer) return;
+  if (!hasMediaPayload(e.dataTransfer)) return;
+  dragDepth.value += 1;
+  dragOverlayVisible.value = true;
+  updateDragPreview(e.dataTransfer);
+}
+
+function onEditorDragOver(e: DragEvent) {
+  if (!props.editable || !e.dataTransfer) return;
+  if (!hasMediaPayload(e.dataTransfer)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  e.dataTransfer.dropEffect = "copy";
+  if (!dragOverlayVisible.value) {
+    dragOverlayVisible.value = true;
+    updateDragPreview(e.dataTransfer);
+  } else {
+    updateDragPreview(e.dataTransfer);
+  }
+}
+
+function onEditorDragLeave(e: DragEvent) {
+  if (!props.editable) return;
+  const wrap = e.currentTarget as HTMLElement;
+  const related = e.relatedTarget as Node | null;
+  if (related && wrap.contains(related)) return;
+  dragDepth.value = Math.max(0, dragDepth.value - 1);
+  if (dragDepth.value === 0) clearDragOverlay();
+}
+
+function clientCoordsFromDrop(position: PhysicalPosition): { x: number; y: number } {
+  const logical = position.toLogical(windowScaleFactor);
+  if (isPointerOverEditor(logical.x, logical.y)) return logical;
+  if (isPointerOverEditor(position.x, position.y)) {
+    return { x: position.x, y: position.y };
+  }
+  return logical;
+}
+
+function isPointerOverEditor(clientX: number, clientY: number): boolean {
+  const zone = editorDropZoneRef.value;
+  if (!zone) return false;
+  const hit = document.elementFromPoint(clientX, clientY);
+  if (hit && zone.contains(hit)) return true;
+  const r = zone.getBoundingClientRect();
+  return clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom;
+}
+
+function setSelectionAtClient(clientX: number, clientY: number) {
+  const ed = editor.value;
+  const view = ed?.view;
+  if (!ed || !view) return;
+  const coords = view.posAtCoords({ left: clientX, top: clientY });
+  if (coords) {
+    ed.chain().setTextSelection(coords.pos).run();
+  } else {
+    ed.chain().focus("end").run();
+  }
+}
+
+function setSelectionAtDrop(event: DragEvent) {
+  setSelectionAtClient(event.clientX, event.clientY);
+}
+
+function setupTauriDragDropListener() {
+  void getCurrentWebview()
+    .onDragDropEvent((event) => {
+      const payload = event.payload;
+
+      if (payload.type === "leave") {
+        clearDragOverlay();
+        return;
+      }
+
+      if (!props.editable) return;
+
+      if (payload.type === "enter") {
+        const paths = mediaPathsFromStrings(payload.paths);
+        if (paths.length === 0) return;
+        dragDepth.value = 1;
+        dragOverlayVisible.value = true;
+        updateDragPreviewFromPaths(paths);
+        return;
+      }
+
+      if (payload.type === "drop") {
+        const paths = mediaPathsFromStrings(payload.paths);
+        const hadOverlay = dragOverlayVisible.value;
+        const { x, y } = clientCoordsFromDrop(payload.position);
+        const overEditor = isPointerOverEditor(x, y) || hadOverlay;
+        clearDragOverlay();
+        if (paths.length === 0) return;
+        if (!overEditor) return;
+        dropHandledAt = Date.now();
+        setSelectionAtClient(x, y);
+        void importFromPaths(paths);
+      }
+    })
+    .then((unlisten) => {
+      unlistenTauriDragDrop = unlisten;
+    })
+    .catch(() => {
+      /* 非 Tauri 环境（纯浏览器 dev）时忽略 */
+    });
+}
+
+async function onEditorDrop(e: DragEvent) {
+  if (!props.editable || !e.dataTransfer) return;
+  if (Date.now() - dropHandledAt < 80) return;
+  const files = mediaFilesFromDataTransfer(e.dataTransfer);
+  if (files.length === 0) return;
+  e.preventDefault();
+  e.stopPropagation();
+  clearDragOverlay();
+  setSelectionAtDrop(e);
+  await handleFiles(files);
+}
 
 const editor = useEditor({
   extensions: [
@@ -41,16 +287,18 @@ const editor = useEditor({
     attributes: {
       class: "note-editor-prosemirror",
     },
-    handleDrop: (view, event, slice, moved) => {
+    handleDrop: (_view, event) => {
       if (!event.dataTransfer || !props.editable) return false;
-      const files = event.dataTransfer.files;
-      if (files.length > 0) {
-        handleFiles(Array.from(files));
-        return true;
-      }
-      return false;
+      const files = mediaFilesFromDataTransfer(event.dataTransfer);
+      if (files.length === 0) return false;
+      event.preventDefault();
+      dropHandledAt = Date.now();
+      clearDragOverlay();
+      setSelectionAtDrop(event);
+      void handleFiles(files);
+      return true;
     },
-    handlePaste: (view, event) => {
+    handlePaste: (_view, event) => {
       if (!event.clipboardData || !props.editable) return false;
       const items = event.clipboardData.items;
       const files: File[] = [];
@@ -88,10 +336,26 @@ watch(
   () => props.editable,
   (v) => {
     editor.value?.setEditable(v);
+    if (!v) clearDragOverlay();
   },
 );
 
+onMounted(() => {
+  void getCurrentWindow()
+    .scaleFactor()
+    .then((factor) => {
+      windowScaleFactor = factor;
+    })
+    .catch(() => {
+      windowScaleFactor = window.devicePixelRatio || 1;
+    });
+  setupTauriDragDropListener();
+});
+
 onBeforeUnmount(() => {
+  unlistenTauriDragDrop?.();
+  unlistenTauriDragDrop = null;
+  clearDragOverlay();
   editor.value?.destroy();
 });
 
@@ -100,25 +364,18 @@ async function handleFiles(files: File[]) {
   if (!ed) return;
   isImporting.value = true;
 
-  const ALLOWED_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "svg", "mp4", "webm", "mov"];
-
   for (const file of files) {
-    const extFromName = file.name.split(".").pop()?.toLowerCase() || "";
-    const extFromType = file.type.split("/").pop()?.toLowerCase() || "";
-    // 优先使用文件名扩展名，若无效则从 MIME 类型推断（覆盖粘贴截图等文件名缺失场景）
-    const ext = ALLOWED_EXTS.includes(extFromName) ? extFromName : extFromType;
-    const isImage = ["jpg", "jpeg", "png", "gif", "webp", "svg"].includes(ext);
-    const isVideo = ["mp4", "webm", "mov"].includes(ext);
-    if (!isImage && !isVideo) continue;
+    const kind = classifyFile(file);
+    if (!kind) continue;
 
     try {
       const buffer = await file.arrayBuffer();
       const result = await invoke("import_media_bytes", {
         data: Array.from(new Uint8Array(buffer)),
-        extension: ext,
+        extension: kind.ext,
       }) as { mediaSrc: string; storageKey: string; absolutePath: string };
 
-      if (isImage) {
+      if (kind.isImage) {
         ed.chain().focus().setImage({ src: convertFileSrc(result.absolutePath) }).run();
       } else {
         ed.chain().focus().setVideo({ src: convertFileSrc(result.absolutePath) }).run();
@@ -159,16 +416,18 @@ async function pickAndImportVideo() {
 async function importFromPaths(paths: string[]) {
   const ed = editor.value;
   if (!ed) return;
+  const mediaPaths = mediaPathsFromStrings(paths);
+  if (mediaPaths.length === 0) return;
   isImporting.value = true;
 
-  for (const filePath of paths) {
+  for (const filePath of mediaPaths) {
     try {
       const result = await invoke("import_media_file", {
         filePath,
       }) as { mediaSrc: string; storageKey: string; absolutePath: string };
 
       const ext = filePath.split(".").pop()?.toLowerCase() || "";
-      const isImage = ["jpg", "jpeg", "png", "gif", "webp", "svg"].includes(ext);
+      const isImage = ALLOWED_IMAGE_EXTS.includes(ext);
 
       if (isImage) {
         ed.chain().focus().setImage({ src: convertFileSrc(result.absolutePath) }).run();
@@ -188,7 +447,7 @@ function tbDisabled(): boolean {
 </script>
 
 <template>
-  <div class="note-rich-root">
+  <div ref="editorDropZoneRef" class="note-rich-root">
     <div v-show="editable" class="rte-toolbar">
       <button
         type="button"
@@ -311,8 +570,37 @@ function tbDisabled(): boolean {
         重做
       </button>
     </div>
-    <div class="rte-editor-wrap">
+    <div
+      class="rte-editor-wrap"
+      :class="{ 'rte-editor-wrap--drag': dragOverlayVisible }"
+      @dragenter="onEditorDragEnter"
+      @dragover="onEditorDragOver"
+      @dragleave="onEditorDragLeave"
+      @drop="onEditorDrop"
+    >
       <editor-content v-if="editor" :editor="editor" />
+      <Transition name="rte-drop-fade">
+        <div
+          v-if="editable && dragOverlayVisible"
+          class="rte-drop-overlay"
+          aria-hidden="true"
+        >
+          <div class="rte-drop-preview">
+            <img
+              v-if="dragPreviewUrl"
+              :src="dragPreviewUrl"
+              class="rte-drop-preview-img"
+              alt=""
+            />
+            <div v-else class="rte-drop-preview-icon">
+              {{ dragPreviewKind === "video" ? "🎥" : "📷" }}
+            </div>
+            <p class="rte-drop-preview-label">{{ dragPreviewLabel }}</p>
+            <p class="rte-drop-preview-hint">松开鼠标即可插入到笔记</p>
+          </div>
+        </div>
+      </Transition>
+      <div v-if="isImporting" class="rte-importing-badge">正在导入媒体…</div>
       <div v-if="!editable" class="rte-mask">
         <p class="rte-mask-text">在中间列表选择一条笔记，或点击左侧「新建笔记」。</p>
       </div>
@@ -379,6 +667,85 @@ function tbDisabled(): boolean {
   min-height: 0;
   overflow: auto;
   position: relative;
+}
+
+.rte-editor-wrap--drag :deep(.note-editor-prosemirror) {
+  pointer-events: none;
+}
+
+.rte-drop-overlay {
+  position: absolute;
+  inset: 12px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 122, 255, 0.08);
+  border: 2px dashed var(--accent, #007aff);
+  border-radius: 12px;
+  pointer-events: none;
+  backdrop-filter: blur(2px);
+}
+
+.rte-drop-preview {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 28px;
+  max-width: min(360px, 90%);
+  text-align: center;
+}
+
+.rte-drop-preview-img {
+  max-width: 240px;
+  max-height: 180px;
+  object-fit: contain;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  background: #fff;
+}
+
+.rte-drop-preview-icon {
+  font-size: 48px;
+  line-height: 1;
+}
+
+.rte-drop-preview-label {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2937;
+  word-break: break-all;
+}
+
+.rte-drop-preview-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--accent, #007aff);
+}
+
+.rte-drop-fade-enter-active,
+.rte-drop-fade-leave-active {
+  transition: opacity 0.15s ease;
+}
+
+.rte-drop-fade-enter-from,
+.rte-drop-fade-leave-to {
+  opacity: 0;
+}
+
+.rte-importing-badge {
+  position: absolute;
+  bottom: 16px;
+  right: 16px;
+  z-index: 4;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.65);
+  border-radius: 8px;
+  pointer-events: none;
 }
 
 .rte-mask {
