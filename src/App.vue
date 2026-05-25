@@ -46,6 +46,38 @@ const listFilterOnlyWithText = ref(false);
 const listFilterOpen = ref(false);
 const listFilterRootRef = ref<HTMLElement | null>(null);
 
+const NAV_COLLAPSED_KEY = "notebook.navCollapsed";
+const LIST_COLLAPSED_KEY = "notebook.listCollapsed";
+
+function readStoredBool(key: string): boolean {
+  try {
+    return localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredBool(key: string, value: boolean) {
+  try {
+    localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+const navCollapsed = ref(readStoredBool(NAV_COLLAPSED_KEY));
+const listCollapsed = ref(readStoredBool(LIST_COLLAPSED_KEY));
+
+function toggleNavCollapsed() {
+  navCollapsed.value = !navCollapsed.value;
+  writeStoredBool(NAV_COLLAPSED_KEY, navCollapsed.value);
+}
+
+function toggleListCollapsed() {
+  listCollapsed.value = !listCollapsed.value;
+  writeStoredBool(LIST_COLLAPSED_KEY, listCollapsed.value);
+}
+
 const editorHtml = ref("<p></p>");
 const noteTitleDraft = ref("");
 let contentSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1260,45 +1292,53 @@ async function reorderNoteAppend(noteId: string) {
 
 <template>
   <div class="app-root" :class="{ 'note-pointer-dragging': ptrDragNoteId }">
-    <div class="app-columns">
+    <div
+      class="app-columns"
+      :class="{ 'nav-collapsed': navCollapsed, 'list-collapsed': listCollapsed }"
+    >
+    <div class="col-shell col-shell--nav">
     <aside class="col-nav">
       <div class="col-overlay-strip col-overlay-strip--nav" data-tauri-drag-region />
-      <AppBrand />
+      <AppBrand class="col-nav-brand" />
       <nav class="nav-primary" aria-label="主导航">
         <button
           type="button"
           class="nav-pill"
           :class="{ active: sidebarNav === 'all' }"
+          title="全部笔记"
           @click="goAllNotes"
         >
           <span class="nav-pill-ic" aria-hidden="true">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
           </span>
-          全部笔记
+          <span class="nav-pill-label">全部笔记</span>
         </button>
         <button
           type="button"
           class="nav-pill"
           :class="{ active: sidebarNav === 'favorites' }"
+          title="收藏"
           @click="goFavorites"
         >
           <span class="nav-pill-ic" aria-hidden="true">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 5.8H4l4.95 3.6-1.9 5.8L12 14.6l5 5.8-1.9-5.8 4.95-3.6h-6.1L12 3z"/></svg>
           </span>
-          收藏
+          <span class="nav-pill-label">收藏</span>
         </button>
         <button
           type="button"
           class="nav-pill"
           :class="{ active: sidebarNav === 'trash' }"
+          title="废纸篓"
           @click="goTrash"
         >
           <span class="nav-pill-ic" aria-hidden="true">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
           </span>
-          废纸篓
+          <span class="nav-pill-label">废纸篓</span>
         </button>
       </nav>
+      <div class="col-nav-expandable">
       <div class="nav-section-label">自定义文件夹</div>
       <ul class="folder-dir" role="list">
         <li
@@ -1343,9 +1383,38 @@ async function reorderNoteAppend(noteId: string) {
         <button type="button" class="linkish" @click="importBook">导入 .tbook</button>
         <button type="button" class="linkish" @click="exportBook">导出 .tbook</button>
       </div>
+      </div>
+      <button
+        v-show="navCollapsed"
+        type="button"
+        class="nav-rail-new"
+        title="新建笔记"
+        aria-label="新建笔记"
+        @click="addNote"
+      >
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
     </aside>
+    </div>
 
+    <div class="col-splitter col-splitter--nav">
+      <button
+        type="button"
+        class="col-splitter-btn"
+        :title="navCollapsed ? '展开导航栏' : '收起导航栏'"
+        :aria-label="navCollapsed ? '展开导航栏' : '收起导航栏'"
+        :aria-expanded="!navCollapsed"
+        @click="toggleNavCollapsed"
+      >
+        <svg class="col-splitter-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M14 6l-6 6 6 6" />
+        </svg>
+      </button>
+    </div>
+
+    <div class="col-shell col-shell--list">
     <section class="col-list">
+      <div class="col-list-inner">
       <div class="col-overlay-strip col-overlay-strip--list" data-tauri-drag-region />
       <header class="list-header">
         <div class="list-header-top">
@@ -1502,7 +1571,24 @@ async function reorderNoteAppend(noteId: string) {
           </div>
         </div>
       </Teleport>
+      </div>
     </section>
+    </div>
+
+    <div class="col-splitter col-splitter--list">
+      <button
+        type="button"
+        class="col-splitter-btn"
+        :title="listCollapsed ? '展开笔记列表' : '收起笔记列表'"
+        :aria-label="listCollapsed ? '展开笔记列表' : '收起笔记列表'"
+        :aria-expanded="!listCollapsed"
+        @click="toggleListCollapsed"
+      >
+        <svg class="col-splitter-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M14 6l-6 6 6 6" />
+        </svg>
+      </button>
+    </div>
 
     <section class="col-main">
       <div class="col-overlay-strip col-overlay-strip--main" data-tauri-drag-region />
@@ -1753,24 +1839,277 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .app-columns {
+  --col-nav-w: 268px;
+  --col-nav-w-collapsed: 72px;
+  --col-list-w: 340px;
+  --col-splitter-w: 14px;
+  --col-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --col-dur: 0.36s;
   flex: 1;
   display: flex;
   min-height: 0;
   overflow: hidden;
 }
 
-.col-nav {
-  width: 268px;
-  min-width: 240px;
-  max-width: 300px;
-  background: var(--bg-side);
+.col-shell {
+  flex-shrink: 0;
+  min-height: 0;
+  overflow: hidden;
+  transition: width var(--col-dur) var(--col-ease);
+}
+
+.col-shell--nav {
+  width: var(--col-nav-w);
   border-right: 1px solid var(--line);
+  box-sizing: border-box;
+}
+
+.app-columns.nav-collapsed .col-shell--nav {
+  width: var(--col-nav-w-collapsed);
+}
+
+.col-shell--list {
+  width: var(--col-list-w);
+}
+
+.app-columns.list-collapsed .col-shell--list {
+  width: 0;
+}
+
+.col-splitter {
+  flex-shrink: 0;
+  width: var(--col-splitter-w);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  z-index: 6;
+  align-self: stretch;
+}
+
+.col-splitter--nav {
+  margin-left: -7px;
+  margin-right: -7px;
+}
+
+.col-splitter--list {
+  margin-left: -7px;
+  margin-right: -7px;
+}
+
+.col-splitter-btn {
+  width: 22px;
+  height: 48px;
+  padding: 0;
+  border: 1px solid rgba(197, 208, 224, 0.95);
+  border-radius: 11px;
+  background: linear-gradient(180deg, #fff 0%, #f8fafc 100%);
+  color: #94a3b8;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow:
+    0 1px 3px rgba(15, 23, 42, 0.06),
+    0 4px 12px rgba(15, 23, 42, 0.05);
+  transition:
+    color 0.22s var(--col-ease),
+    border-color 0.22s var(--col-ease),
+    background 0.22s var(--col-ease),
+    box-shadow 0.22s var(--col-ease),
+    transform 0.22s var(--col-ease);
+}
+
+.col-splitter-btn:hover {
+  color: var(--accent);
+  border-color: #b8c9e8;
+  background: #fff;
+  box-shadow:
+    0 2px 8px rgba(37, 99, 235, 0.12),
+    0 6px 18px rgba(15, 23, 42, 0.08);
+  transform: scale(1.04);
+}
+
+.col-splitter-btn:active {
+  transform: scale(0.97);
+}
+
+.col-splitter-chevron {
+  transition: transform var(--col-dur) var(--col-ease);
+}
+
+.app-columns.nav-collapsed .col-splitter--nav .col-splitter-chevron {
+  transform: rotate(180deg);
+}
+
+.app-columns.list-collapsed .col-splitter--list .col-splitter-chevron {
+  transform: rotate(180deg);
+}
+
+.col-nav {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  background: var(--bg-side);
+  border-right: none;
   display: flex;
   flex-direction: column;
-  padding: 10px 14px 16px;
+  padding: 10px 12px 16px;
   gap: 12px;
   min-height: 0;
   overflow-x: hidden;
+  overflow-y: auto;
+  box-sizing: border-box;
+  transition: padding var(--col-dur) var(--col-ease);
+}
+
+.app-columns.nav-collapsed .col-nav {
+  padding: 10px 8px 16px;
+  align-items: center;
+}
+
+.col-nav-expandable {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  overflow: hidden;
+  transition:
+    opacity calc(var(--col-dur) * 0.75) var(--col-ease),
+    max-height var(--col-dur) var(--col-ease),
+    transform calc(var(--col-dur) * 0.85) var(--col-ease);
+  max-height: 2000px;
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.app-columns.nav-collapsed .col-nav-expandable {
+  max-height: 0;
+  opacity: 0;
+  transform: translateX(-12px);
+  pointer-events: none;
+  margin: 0;
+  gap: 0;
+}
+
+.nav-pill-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: opacity calc(var(--col-dur) * 0.6) var(--col-ease);
+}
+
+.app-columns.nav-collapsed .nav-pill-label {
+  opacity: 0;
+  width: 0;
+  flex: 0;
+}
+
+.app-columns.nav-collapsed .nav-pill {
+  justify-content: center;
+  padding: 10px;
+  gap: 0;
+  width: 48px;
+}
+
+.app-columns.nav-collapsed .nav-primary {
+  width: 100%;
+  align-items: center;
+}
+
+.nav-rail-new {
+  flex-shrink: 0;
+  width: 48px;
+  height: 48px;
+  border: none;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #1e40af 0%, #1d4ed8 100%);
+  color: #fff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 10px rgba(29, 78, 216, 0.35);
+  transition:
+    transform 0.2s var(--col-ease),
+    box-shadow 0.2s var(--col-ease),
+    opacity 0.25s var(--col-ease);
+  animation: rail-new-in 0.32s var(--col-ease);
+}
+
+@keyframes rail-new-in {
+  from {
+    opacity: 0;
+    transform: scale(0.85);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.nav-rail-new:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(29, 78, 216, 0.45);
+}
+
+.app-columns.nav-collapsed :deep(.col-nav-brand .nav-brand) {
+  padding: 0 0 4px;
+}
+
+.app-columns.nav-collapsed :deep(.col-nav-brand .nav-brand-visual) {
+  flex-direction: column;
+  align-items: center;
+  gap: 0;
+}
+
+.app-columns.nav-collapsed :deep(.col-nav-brand .nav-brand-text) {
+  opacity: 0;
+  max-height: 0;
+  overflow: hidden;
+  margin: 0;
+  pointer-events: none;
+  transition: opacity 0.22s var(--col-ease), max-height var(--col-dur) var(--col-ease);
+}
+
+.app-columns.nav-collapsed :deep(.col-nav-brand .nav-brand-logo) {
+  width: 44px;
+  height: 44px;
+  transition: width var(--col-dur) var(--col-ease), height var(--col-dur) var(--col-ease);
+}
+
+.col-list {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  background: var(--bg-middle);
+  border-right: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.col-list-inner {
+  width: var(--col-list-w);
+  min-width: var(--col-list-w);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  box-sizing: border-box;
+  border-right: 1px solid #cdd6e4;
+  transition:
+    opacity calc(var(--col-dur) * 0.7) var(--col-ease),
+    transform calc(var(--col-dur) * 0.85) var(--col-ease);
+}
+
+.app-columns.list-collapsed .col-list-inner {
+  opacity: 0;
+  transform: translateX(-16px);
+  pointer-events: none;
 }
 
 .col-overlay-strip {
@@ -2044,17 +2383,6 @@ async function reorderNoteAppend(noteId: string) {
   font-size: 13px;
   text-align: left;
   padding: 4px 2px;
-}
-
-.col-list {
-  width: 340px;
-  min-width: 300px;
-  max-width: 400px;
-  background: var(--bg-middle);
-  border-right: 1px solid #cdd6e4;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
 }
 
 .list-header {
@@ -2439,6 +2767,25 @@ async function reorderNoteAppend(noteId: string) {
   min-width: 0;
   min-height: 0;
   background: var(--bg);
+  transition: flex var(--col-dur) var(--col-ease);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .col-shell,
+  .col-nav-expandable,
+  .col-list-inner,
+  .col-splitter-chevron,
+  .col-splitter-btn,
+  .nav-pill-label,
+  .nav-rail-new {
+    transition: none;
+    animation: none;
+  }
+
+  .app-columns.nav-collapsed .col-nav-expandable,
+  .app-columns.list-collapsed .col-list-inner {
+    transform: none;
+  }
 }
 
 .main-title-bar {
