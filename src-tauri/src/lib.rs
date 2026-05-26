@@ -240,6 +240,7 @@ fn import_tbook(state: State<DbState>, path: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let conn = db::open(&app.handle())?;
             app.manage(DbState(Mutex::new(conn)));

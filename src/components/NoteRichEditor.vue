@@ -1,7 +1,10 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { getMarkRange } from "@tiptap/core";
+import { computed, onBeforeUnmount, onMounted, ref, watch, nextTick } from "vue";
 import { EditorContent, useEditor } from "@tiptap/vue-3";
 import Placeholder from "@tiptap/extension-placeholder";
+import Link from "@tiptap/extension-link";
+import Underline from "@tiptap/extension-underline";
 import StarterKit from "@tiptap/starter-kit";
 import Image from "@tiptap/extension-image";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
@@ -33,7 +36,35 @@ const dragPreviewLabel = ref("");
 const dragPreviewKind = ref<"image" | "video" | "media">("image");
 const dragDepth = ref(0);
 const editorDropZoneRef = ref<HTMLElement | null>(null);
+const linkBtnRef = ref<HTMLElement | null>(null);
+const linkPopoverRef = ref<HTMLElement | null>(null);
+const linkFormOpen = ref(false);
+/** create=新建链接，edit=编辑，view=只读查看 */
+const linkFormMode = ref<"create" | "edit" | "view">("create");
+const linkFormTitle = ref("");
+const linkFormHref = ref("");
+const linkFormRange = ref<{ from: number; to: number } | null>(null);
+const linkPopoverStyle = ref({ top: "0px", left: "0px" });
+
+const linkFormTitleLabel = computed(() =>
+  linkFormMode.value === "view" ? "查看链接" : linkFormRange.value ? "编辑链接" : "插入链接",
+);
+
+const linkHover = ref({
+  visible: false,
+  href: "",
+  title: "",
+  from: 0,
+  to: 0,
+  top: 0,
+  left: 0,
+});
+
+const HEADING_LEVELS = [1, 2, 3, 4, 5, 6] as const;
+
 let dragPreviewObjectUrl: string | null = null;
+let linkHoverHideTimer: ReturnType<typeof setTimeout> | null = null;
+let linkFormDismissHandler: ((e: MouseEvent) => void) | null = null;
 let dropHandledAt = 0;
 let unlistenTauriDragDrop: UnlistenFn | null = null;
 let windowScaleFactor = 1;
@@ -268,7 +299,12 @@ async function onEditorDrop(e: DragEvent) {
 const editor = useEditor({
   extensions: [
     StarterKit.configure({
-      heading: { levels: [2, 3] },
+      heading: { levels: [1, 2, 3, 4, 5, 6] },
+    }),
+    Underline,
+    Link.configure({
+      openOnClick: false,
+      HTMLAttributes: { class: "notebook-inline-link" },
     }),
     Placeholder.configure({
       placeholder: "在此处输入正文…",
@@ -315,6 +351,27 @@ const editor = useEditor({
       }
       return false;
     },
+    handleDOMEvents: {
+      mouseover: (view, event) => {
+        if (!props.editable || linkFormOpen.value) return false;
+        const target = (event.target as HTMLElement).closest(
+          "a.notebook-inline-link",
+        ) as HTMLAnchorElement | null;
+        if (!target || !view.dom.contains(target)) return false;
+        showLinkHoverFromAnchor(target);
+        return false;
+      },
+      mouseout: (view, event) => {
+        if (!props.editable) return false;
+        const related = event.relatedTarget as Node | null;
+        if (related && view.dom.contains(related)) {
+          const hoverEl = document.querySelector(".rte-link-hover");
+          if (hoverEl?.contains(related)) return false;
+        }
+        scheduleHideLinkHover();
+        return false;
+      },
+    },
   },
   onUpdate: ({ editor: ed }) => {
     emit("update:modelValue", ed.getHTML());
@@ -336,7 +393,11 @@ watch(
   () => props.editable,
   (v) => {
     editor.value?.setEditable(v);
-    if (!v) clearDragOverlay();
+    if (!v) {
+      clearDragOverlay();
+      closeLinkForm();
+      linkHover.value.visible = false;
+    }
   },
 );
 
@@ -350,12 +411,25 @@ onMounted(() => {
       windowScaleFactor = window.devicePixelRatio || 1;
     });
   setupTauriDragDropListener();
+  linkFormDismissHandler = (e: MouseEvent) => {
+    if (!linkFormOpen.value) return;
+    const t = e.target as Node;
+    if (linkBtnRef.value?.contains(t)) return;
+    if (linkPopoverRef.value?.contains(t)) return;
+    closeLinkForm();
+  };
+  document.addEventListener("mousedown", linkFormDismissHandler, true);
 });
 
 onBeforeUnmount(() => {
   unlistenTauriDragDrop?.();
   unlistenTauriDragDrop = null;
   clearDragOverlay();
+  if (linkFormDismissHandler) {
+    document.removeEventListener("mousedown", linkFormDismissHandler, true);
+    linkFormDismissHandler = null;
+  }
+  clearLinkHoverHideTimer();
   editor.value?.destroy();
 });
 
@@ -444,6 +518,221 @@ async function importFromPaths(paths: string[]) {
 function tbDisabled(): boolean {
   return !props.editable || !editor.value || isImporting.value;
 }
+
+function tbUndoDisabled(): boolean {
+  return tbDisabled() || !editor.value?.can().chain().focus().undo().run();
+}
+
+function tbRedoDisabled(): boolean {
+  return tbDisabled() || !editor.value?.can().chain().focus().redo().run();
+}
+
+function tbSinkListDisabled(): boolean {
+  return (
+    tbDisabled() ||
+    !editor.value?.can().chain().focus().sinkListItem("listItem").run()
+  );
+}
+
+function tbLiftListDisabled(): boolean {
+  return (
+    tbDisabled() ||
+    !editor.value?.can().chain().focus().liftListItem("listItem").run()
+  );
+}
+
+function clearFormatting() {
+  editor.value?.chain().focus().unsetAllMarks().clearNodes().run();
+}
+
+function normalizeHref(raw: string): string {
+  const t = raw.trim();
+  if (!t) return "";
+  if (/^(https?:|mailto:|tel:|#)/i.test(t)) return t;
+  return `https://${t}`;
+}
+
+function clampPopoverLeft(left: number, width: number): number {
+  const margin = 8;
+  const maxLeft = window.innerWidth - width - margin;
+  return Math.max(margin, Math.min(left, maxLeft));
+}
+
+function positionLinkPopoverAtRect(rect: DOMRect) {
+  const width = 300;
+  const left = clampPopoverLeft(rect.left + rect.width / 2 - width / 2, width);
+  linkPopoverStyle.value = {
+    top: `${rect.bottom + 8}px`,
+    left: `${left}px`,
+  };
+}
+
+async function positionLinkPopoverFromButton() {
+  await nextTick();
+  const el = linkBtnRef.value;
+  if (!el) return;
+  positionLinkPopoverAtRect(el.getBoundingClientRect());
+}
+
+function clearLinkHoverHideTimer() {
+  if (linkHoverHideTimer) {
+    clearTimeout(linkHoverHideTimer);
+    linkHoverHideTimer = null;
+  }
+}
+
+function scheduleHideLinkHover() {
+  clearLinkHoverHideTimer();
+  linkHoverHideTimer = setTimeout(() => {
+    linkHover.value.visible = false;
+    linkHoverHideTimer = null;
+  }, 180);
+}
+
+function showLinkHoverFromAnchor(anchor: HTMLAnchorElement) {
+  const ed = editor.value;
+  if (!ed || !props.editable) return;
+  clearLinkHoverHideTimer();
+  const view = ed.view;
+  const pos = view.posAtDOM(anchor, 0);
+  const $pos = view.state.doc.resolve(pos);
+  const range = getMarkRange($pos, view.state.schema.marks.link);
+  if (!range) return;
+  const href = anchor.getAttribute("href") || "";
+  const title = anchor.textContent?.trim() || href;
+  const rect = anchor.getBoundingClientRect();
+  linkHover.value = {
+    visible: true,
+    href,
+    title,
+    from: range.from,
+    to: range.to,
+    top: rect.bottom + 6,
+    left: rect.left + rect.width / 2,
+  };
+}
+
+function closeLinkForm() {
+  linkFormOpen.value = false;
+  linkFormRange.value = null;
+  linkFormMode.value = "create";
+}
+
+function openLinkFormFromToolbar() {
+  if (tbDisabled()) return;
+  const ed = editor.value;
+  if (!ed) return;
+  if (linkFormOpen.value) {
+    closeLinkForm();
+    return;
+  }
+  linkHover.value.visible = false;
+  linkFormMode.value = "create";
+  const { from, to, empty } = ed.state.selection;
+  if (ed.isActive("link")) {
+    const $pos = ed.state.doc.resolve(from);
+    const range = getMarkRange($pos, ed.state.schema.marks.link);
+    if (range) {
+      linkFormRange.value = range;
+      linkFormTitle.value = ed.state.doc.textBetween(range.from, range.to);
+    } else {
+      linkFormRange.value = { from, to };
+      linkFormTitle.value = ed.state.doc.textBetween(from, to);
+    }
+    linkFormHref.value = (ed.getAttributes("link").href as string) || "";
+    linkFormMode.value = "edit";
+  } else if (!empty) {
+    linkFormTitle.value = ed.state.doc.textBetween(from, to);
+    linkFormHref.value = "https://";
+    linkFormRange.value = { from, to };
+  } else {
+    linkFormTitle.value = "";
+    linkFormHref.value = "https://";
+    linkFormRange.value = null;
+  }
+  linkFormOpen.value = true;
+  void positionLinkPopoverFromButton();
+}
+
+async function openLinkPopoverFromHover(
+  mode: "view" | "edit",
+  e?: MouseEvent,
+) {
+  e?.preventDefault();
+  e?.stopPropagation();
+  clearLinkHoverHideTimer();
+  linkFormTitle.value = linkHover.value.title;
+  linkFormHref.value = linkHover.value.href;
+  linkFormRange.value = { from: linkHover.value.from, to: linkHover.value.to };
+  linkFormMode.value = mode;
+  linkHover.value.visible = false;
+  linkFormOpen.value = true;
+  await nextTick();
+  const width = 300;
+  const left = clampPopoverLeft(linkHover.value.left - width / 2, width);
+  linkPopoverStyle.value = {
+    top: `${linkHover.value.top}px`,
+    left: `${left}px`,
+  };
+}
+
+function openLinkFormFromHover(e?: MouseEvent) {
+  void openLinkPopoverFromHover("edit", e);
+}
+
+function submitLinkForm() {
+  const ed = editor.value;
+  if (!ed) return;
+  const href = normalizeHref(linkFormHref.value);
+  if (!href) return;
+  const title = linkFormTitle.value.trim() || href;
+  const range = linkFormRange.value;
+  const chain = ed.chain().focus();
+  if (range) {
+    chain
+      .setTextSelection(range)
+      .deleteSelection()
+      .insertContent({
+        type: "text",
+        text: title,
+        marks: [{ type: "link", attrs: { href } }],
+      })
+      .run();
+  } else {
+    const { empty, from, to } = ed.state.selection;
+    if (!empty) {
+      chain.setTextSelection({ from, to }).deleteSelection();
+    }
+    chain
+      .insertContent({
+        type: "text",
+        text: title,
+        marks: [{ type: "link", attrs: { href } }],
+      })
+      .run();
+  }
+  closeLinkForm();
+}
+
+function removeLinkFromForm() {
+  const ed = editor.value;
+  const range = linkFormRange.value;
+  if (!ed || !range) return;
+  ed.chain().focus().setTextSelection(range).unsetLink().run();
+  closeLinkForm();
+}
+
+function viewHoveredLink(e: MouseEvent) {
+  void openLinkPopoverFromHover("view", e);
+}
+
+function onLinkHoverEnter() {
+  clearLinkHoverHideTimer();
+}
+
+function onLinkHoverLeave() {
+  scheduleHideLinkHover();
+}
 </script>
 
 <template>
@@ -451,55 +740,88 @@ function tbDisabled(): boolean {
     <div v-show="editable" class="rte-toolbar">
       <button
         type="button"
-        class="rte-tb-btn"
+        class="rte-tb-btn rte-tb-btn--wide"
+        :disabled="tbDisabled()"
+        title="正文段落"
+        @click="editor?.chain().focus().setParagraph().run()"
+      >
+        正文
+      </button>
+      <button
+        v-for="level in HEADING_LEVELS"
+        :key="level"
+        type="button"
+        class="rte-tb-btn rte-tb-btn--heading"
+        :class="{ on: editor?.isActive('heading', { level }) }"
+        :disabled="tbDisabled()"
+        :title="`标题 ${level}`"
+        @click="editor?.chain().focus().toggleHeading({ level }).run()"
+      >
+        H{{ level }}
+      </button>
+      <span class="rte-tb-sep" />
+      <button
+        type="button"
+        class="rte-tb-btn rte-tb-btn--icon"
         :class="{ on: editor?.isActive('bold') }"
         :disabled="tbDisabled()"
-        title="加粗"
+        title="加粗 (⌘B)"
         @click="editor?.chain().focus().toggleBold().run()"
       >
-        B
+        <strong>B</strong>
       </button>
       <button
         type="button"
-        class="rte-tb-btn"
+        class="rte-tb-btn rte-tb-btn--icon"
         :class="{ on: editor?.isActive('italic') }"
         :disabled="tbDisabled()"
-        title="斜体"
+        title="斜体 (⌘I)"
         @click="editor?.chain().focus().toggleItalic().run()"
       >
-        I
+        <em>I</em>
       </button>
       <button
         type="button"
-        class="rte-tb-btn"
+        class="rte-tb-btn rte-tb-btn--icon"
+        :class="{ on: editor?.isActive('underline') }"
+        :disabled="tbDisabled()"
+        title="下划线 (⌘U)"
+        @click="editor?.chain().focus().toggleUnderline().run()"
+      >
+        <span class="rte-tb-u">U</span>
+      </button>
+      <button
+        type="button"
+        class="rte-tb-btn rte-tb-btn--icon"
         :class="{ on: editor?.isActive('strike') }"
         :disabled="tbDisabled()"
         title="删除线"
         @click="editor?.chain().focus().toggleStrike().run()"
       >
-        S
-      </button>
-      <span class="rte-tb-sep" />
-      <button
-        type="button"
-        class="rte-tb-btn"
-        :class="{ on: editor?.isActive('heading', { level: 2 }) }"
-        :disabled="tbDisabled()"
-        title="标题 2"
-        @click="editor?.chain().focus().toggleHeading({ level: 2 }).run()"
-      >
-        H2
+        <s>S</s>
       </button>
       <button
         type="button"
         class="rte-tb-btn"
-        :class="{ on: editor?.isActive('heading', { level: 3 }) }"
+        :class="{ on: editor?.isActive('code') }"
         :disabled="tbDisabled()"
-        title="标题 3"
-        @click="editor?.chain().focus().toggleHeading({ level: 3 }).run()"
+        title="行内代码"
+        @click="editor?.chain().focus().toggleCode().run()"
       >
-        H3
+        &lt;/&gt;
       </button>
+      <div ref="linkBtnRef" class="rte-link-btn-wrap">
+        <button
+          type="button"
+          class="rte-tb-btn"
+          :class="{ on: editor?.isActive('link') || linkFormOpen }"
+          :disabled="tbDisabled()"
+          title="插入或编辑链接"
+          @click="openLinkFormFromToolbar"
+        >
+          链接
+        </button>
+      </div>
       <span class="rte-tb-sep" />
       <button
         type="button"
@@ -509,7 +831,7 @@ function tbDisabled(): boolean {
         title="无序列表"
         @click="editor?.chain().focus().toggleBulletList().run()"
       >
-        列表
+        • 列表
       </button>
       <button
         type="button"
@@ -519,17 +841,63 @@ function tbDisabled(): boolean {
         title="有序列表"
         @click="editor?.chain().focus().toggleOrderedList().run()"
       >
-        1.
+        1. 列表
+      </button>
+      <button
+        type="button"
+        class="rte-tb-btn"
+        :disabled="tbSinkListDisabled()"
+        title="增加列表缩进"
+        @click="editor?.chain().focus().sinkListItem('listItem').run()"
+      >
+        缩进+
+      </button>
+      <button
+        type="button"
+        class="rte-tb-btn"
+        :disabled="tbLiftListDisabled()"
+        title="减少列表缩进"
+        @click="editor?.chain().focus().liftListItem('listItem').run()"
+      >
+        缩进−
       </button>
       <button
         type="button"
         class="rte-tb-btn"
         :class="{ on: editor?.isActive('blockquote') }"
         :disabled="tbDisabled()"
-        title="引用"
+        title="引用块"
         @click="editor?.chain().focus().toggleBlockquote().run()"
       >
         引用
+      </button>
+      <button
+        type="button"
+        class="rte-tb-btn"
+        :class="{ on: editor?.isActive('codeBlock') }"
+        :disabled="tbDisabled()"
+        title="代码块"
+        @click="editor?.chain().focus().toggleCodeBlock().run()"
+      >
+        代码块
+      </button>
+      <button
+        type="button"
+        class="rte-tb-btn"
+        :disabled="tbDisabled()"
+        title="分隔线"
+        @click="editor?.chain().focus().setHorizontalRule().run()"
+      >
+        分隔线
+      </button>
+      <button
+        type="button"
+        class="rte-tb-btn"
+        :disabled="tbDisabled()"
+        title="软换行 (Shift+Enter)"
+        @click="editor?.chain().focus().setHardBreak().run()"
+      >
+        换行
       </button>
       <span class="rte-tb-sep" />
       <button
@@ -539,7 +907,7 @@ function tbDisabled(): boolean {
         title="导入图片"
         @click="pickAndImportImage"
       >
-        📷
+        图片
       </button>
       <button
         type="button"
@@ -548,14 +916,14 @@ function tbDisabled(): boolean {
         title="导入视频"
         @click="pickAndImportVideo"
       >
-        🎥
+        视频
       </button>
       <span class="rte-tb-sep" />
       <button
         type="button"
         class="rte-tb-btn"
-        :disabled="tbDisabled()"
-        title="撤销"
+        :disabled="tbUndoDisabled()"
+        title="撤销 (⌘Z)"
         @click="editor?.chain().focus().undo().run()"
       >
         撤销
@@ -563,11 +931,20 @@ function tbDisabled(): boolean {
       <button
         type="button"
         class="rte-tb-btn"
-        :disabled="tbDisabled()"
-        title="重做"
+        :disabled="tbRedoDisabled()"
+        title="重做 (⌘⇧Z)"
         @click="editor?.chain().focus().redo().run()"
       >
         重做
+      </button>
+      <button
+        type="button"
+        class="rte-tb-btn"
+        :disabled="tbDisabled()"
+        title="清除选区格式"
+        @click="clearFormatting"
+      >
+        清除格式
       </button>
     </div>
     <div
@@ -605,6 +982,102 @@ function tbDisabled(): boolean {
         <p class="rte-mask-text">在中间列表选择一条笔记，或点击左侧「新建笔记」。</p>
       </div>
     </div>
+
+    <Teleport to="body">
+      <div
+        v-if="linkFormOpen"
+        ref="linkPopoverRef"
+        class="rte-link-popover"
+        role="dialog"
+        :aria-label="linkFormTitleLabel"
+        :style="linkPopoverStyle"
+        @mousedown.stop
+      >
+        <p class="rte-link-popover-title">{{ linkFormTitleLabel }}</p>
+        <label class="rte-link-field">
+          <span class="rte-link-field-label">显示标题</span>
+          <input
+            v-model="linkFormTitle"
+            type="text"
+            class="rte-link-field-input"
+            :class="{ 'rte-link-field-input--readonly': linkFormMode === 'view' }"
+            :readonly="linkFormMode === 'view'"
+            :tabindex="linkFormMode === 'view' ? -1 : 0"
+            placeholder="链接显示文字"
+            @keydown.enter.prevent="linkFormMode !== 'view' && submitLinkForm()"
+          />
+        </label>
+        <label class="rte-link-field">
+          <span class="rte-link-field-label">链接地址</span>
+          <input
+            v-model="linkFormHref"
+            type="url"
+            class="rte-link-field-input"
+            :class="{ 'rte-link-field-input--readonly': linkFormMode === 'view' }"
+            :readonly="linkFormMode === 'view'"
+            :tabindex="linkFormMode === 'view' ? -1 : 0"
+            placeholder="https://"
+            @keydown.enter.prevent="linkFormMode !== 'view' && submitLinkForm()"
+          />
+        </label>
+        <div class="rte-link-popover-actions">
+          <template v-if="linkFormMode === 'view'">
+            <button type="button" class="rte-link-action rte-link-action--primary" @click="closeLinkForm">
+              关闭
+            </button>
+          </template>
+          <template v-else>
+            <button
+              v-if="linkFormRange"
+              type="button"
+              class="rte-link-action rte-link-action--danger"
+              @click="removeLinkFromForm"
+            >
+              移除
+            </button>
+            <button type="button" class="rte-link-action" @click="closeLinkForm">
+              取消
+            </button>
+            <button
+              type="button"
+              class="rte-link-action rte-link-action--primary"
+              @click="submitLinkForm"
+            >
+              确定
+            </button>
+          </template>
+        </div>
+      </div>
+
+      <div
+        v-if="linkHover.visible && !linkFormOpen"
+        class="rte-link-hover"
+        :style="{
+          top: linkHover.top + 'px',
+          left: linkHover.left + 'px',
+        }"
+        @mouseenter="onLinkHoverEnter"
+        @mouseleave="onLinkHoverLeave"
+        @mousedown.stop
+      >
+        <button
+          type="button"
+          class="rte-link-hover-btn"
+          @mousedown.prevent.stop="viewHoveredLink"
+          @click.prevent.stop="viewHoveredLink"
+        >
+          查看
+        </button>
+        <button
+          type="button"
+          class="rte-link-hover-btn"
+          @mousedown.prevent.stop="openLinkFormFromHover"
+          @click.prevent.stop="openLinkFormFromHover"
+        >
+          修改
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -621,23 +1094,196 @@ function tbDisabled(): boolean {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   padding: 8px 14px;
   border-bottom: 1px solid var(--line, #e8eaed);
   background: #fff;
   flex-shrink: 0;
+  row-gap: 6px;
 }
 
 .rte-tb-btn {
   border: 1px solid transparent;
   background: #f0f2f5;
   border-radius: 6px;
-  padding: 4px 10px;
+  padding: 5px 9px;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
   color: #333;
   font-family: inherit;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.rte-tb-btn--wide {
+  min-width: 40px;
+}
+
+.rte-tb-btn--icon {
+  min-width: 30px;
+  padding: 5px 7px;
+  text-align: center;
+}
+
+.rte-tb-btn--icon strong,
+.rte-tb-btn--icon em,
+.rte-tb-btn--icon s {
+  font-size: 13px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.rte-tb-btn--icon em {
+  font-style: italic;
+  font-weight: 600;
+}
+
+.rte-tb-u {
+  text-decoration: underline;
+}
+
+.rte-tb-btn--heading {
+  min-width: 28px;
+  padding: 5px 6px;
+}
+
+.rte-link-btn-wrap {
+  display: inline-flex;
+}
+
+.rte-link-popover {
+  position: fixed;
+  z-index: 200;
+  width: 300px;
+  padding: 14px 14px 12px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  box-shadow:
+    0 8px 30px rgba(15, 23, 42, 0.12),
+    0 2px 8px rgba(15, 23, 42, 0.06);
+}
+
+.rte-link-popover-title {
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #111827;
+}
+
+.rte-link-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.rte-link-field-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #6b7280;
+}
+
+.rte-link-field-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: inherit;
+  color: #111827;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.rte-link-field-input:focus {
+  border-color: var(--accent, #2563eb);
+}
+
+.rte-link-field-input--readonly {
+  background: #f9fafb;
+  color: #374151;
+  cursor: default;
+}
+
+.rte-link-field-input--readonly:focus {
+  border-color: #e5e7eb;
+}
+
+.rte-link-popover-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.rte-link-action {
+  border: 1px solid #e5e7eb;
+  background: #fff;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  color: #374151;
+}
+
+.rte-link-action:hover {
+  background: #f9fafb;
+}
+
+.rte-link-action--primary {
+  border-color: var(--accent, #2563eb);
+  background: var(--accent, #2563eb);
+  color: #fff;
+}
+
+.rte-link-action--primary:hover {
+  background: #1d4ed8;
+}
+
+.rte-link-action--danger {
+  margin-right: auto;
+  border-color: #fecaca;
+  color: #dc2626;
+}
+
+.rte-link-action--danger:hover {
+  background: #fef2f2;
+}
+
+.rte-link-hover {
+  position: fixed;
+  z-index: 199;
+  transform: translateX(-50%);
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.12);
+}
+
+.rte-link-hover-btn {
+  border: none;
+  background: #f3f4f6;
+  border-radius: 7px;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  color: #374151;
+  white-space: nowrap;
+}
+
+.rte-link-hover-btn:hover {
+  background: var(--accent-sidebar-active, #e8f1fe);
+  color: var(--accent, #2563eb);
 }
 
 .rte-tb-btn:hover:not(:disabled) {
@@ -793,14 +1439,38 @@ function tbDisabled(): boolean {
   margin: 0 0 0.6em;
 }
 
+:deep(.note-editor-prosemirror h1) {
+  font-size: 1.75em;
+  margin: 0.85em 0 0.45em;
+  letter-spacing: -0.02em;
+}
+
 :deep(.note-editor-prosemirror h2) {
-  font-size: 1.35em;
+  font-size: 1.45em;
   margin: 0.8em 0 0.4em;
 }
 
 :deep(.note-editor-prosemirror h3) {
-  font-size: 1.15em;
+  font-size: 1.25em;
   margin: 0.7em 0 0.35em;
+}
+
+:deep(.note-editor-prosemirror h4) {
+  font-size: 1.1em;
+  margin: 0.65em 0 0.3em;
+}
+
+:deep(.note-editor-prosemirror h5) {
+  font-size: 1em;
+  margin: 0.6em 0 0.28em;
+  font-weight: 700;
+}
+
+:deep(.note-editor-prosemirror h6) {
+  font-size: 0.95em;
+  margin: 0.55em 0 0.25em;
+  font-weight: 700;
+  color: #4b5563;
 }
 
 :deep(.note-editor-prosemirror ul),
@@ -814,6 +1484,44 @@ function tbDisabled(): boolean {
   padding-left: 12px;
   border-left: 3px solid #c5cad3;
   color: #444;
+}
+
+:deep(.note-editor-prosemirror code) {
+  background: #f3f4f6;
+  padding: 0.12em 0.35em;
+  border-radius: 4px;
+  font-size: 0.9em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+:deep(.note-editor-prosemirror pre) {
+  background: #1e293b;
+  color: #e2e8f0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 0 0 0.75em;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+:deep(.note-editor-prosemirror pre code) {
+  background: none;
+  padding: 0;
+  color: inherit;
+  font-size: inherit;
+}
+
+:deep(.note-editor-prosemirror hr) {
+  border: none;
+  border-top: 1px solid #e5e7eb;
+  margin: 1em 0;
+}
+
+:deep(.note-editor-prosemirror a.notebook-inline-link) {
+  color: var(--accent, #2563eb);
+  text-decoration: underline;
+  cursor: pointer;
 }
 
 :deep(.note-editor-prosemirror p.is-editor-empty:first-child::before) {
