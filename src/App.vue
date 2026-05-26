@@ -1377,15 +1377,17 @@ async function reorderNoteAppend(noteId: string) {
           </button>
         </li>
       </ul>
-      <button type="button" class="btn-new-note" @click="addNote">+ 新建笔记</button>
-      <button type="button" class="btn-text-link" @click="addFolder">新建文件夹</button>
-      <div class="nav-footer">
-        <button type="button" class="linkish" @click="importBook">导入 .tbook</button>
-        <button type="button" class="linkish" @click="exportBook">导出 .tbook</button>
       </div>
+      <div v-if="!navCollapsed" class="col-nav-actions">
+        <button type="button" class="btn-new-note" @click="addNote">+ 新建笔记</button>
+        <button type="button" class="btn-text-link" @click="addFolder">新建文件夹</button>
+        <div class="nav-footer">
+          <button type="button" class="linkish" @click="importBook">导入 .tbook</button>
+          <button type="button" class="linkish" @click="exportBook">导出 .tbook</button>
+        </div>
       </div>
       <button
-        v-show="navCollapsed"
+        v-if="navCollapsed"
         type="button"
         class="nav-rail-new"
         title="新建笔记"
@@ -1854,7 +1856,10 @@ async function reorderNoteAppend(noteId: string) {
 .col-shell {
   flex-shrink: 0;
   min-height: 0;
+  height: 100%;
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
   transition: width var(--col-dur) var(--col-ease);
 }
 
@@ -1957,8 +1962,8 @@ async function reorderNoteAppend(noteId: string) {
   padding: 10px 12px 16px;
   gap: 12px;
   min-height: 0;
-  overflow-x: hidden;
-  overflow-y: auto;
+  flex: 1;
+  overflow: hidden;
   box-sizing: border-box;
   transition: padding var(--col-dur) var(--col-ease);
 }
@@ -1972,8 +1977,11 @@ async function reorderNoteAppend(noteId: string) {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  flex: 1;
   min-width: 0;
-  overflow: hidden;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   transition:
     opacity calc(var(--col-dur) * 0.75) var(--col-ease),
     max-height var(--col-dur) var(--col-ease),
@@ -1981,6 +1989,16 @@ async function reorderNoteAppend(noteId: string) {
   max-height: 2000px;
   opacity: 1;
   transform: translateX(0);
+}
+
+.col-nav-actions {
+  flex-shrink: 0;
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  padding-top: 4px;
 }
 
 .app-columns.nav-collapsed .col-nav-expandable {
@@ -2017,6 +2035,10 @@ async function reorderNoteAppend(noteId: string) {
 .app-columns.nav-collapsed .nav-primary {
   width: 100%;
   align-items: center;
+}
+
+.app-columns.nav-collapsed .nav-rail-new {
+  margin-top: auto;
 }
 
 .nav-rail-new {
@@ -2329,7 +2351,6 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .btn-new-note {
-  margin-top: 4px;
   width: 100%;
   border: none;
   border-radius: 12px;
