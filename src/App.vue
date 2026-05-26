@@ -78,6 +78,23 @@ function toggleListCollapsed() {
   writeStoredBool(LIST_COLLAPSED_KEY, listCollapsed.value);
 }
 
+/** 全屏编辑：隐藏左侧导航与笔记列表，仅保留编辑区 */
+const editorFocusMode = ref(false);
+
+function enterEditorFocusMode() {
+  if (!selectedNoteId.value || sidebarNav.value === "trash") return;
+  editorFocusMode.value = true;
+}
+
+function exitEditorFocusMode() {
+  editorFocusMode.value = false;
+}
+
+function toggleEditorFocusMode() {
+  if (editorFocusMode.value) exitEditorFocusMode();
+  else enterEditorFocusMode();
+}
+
 const editorHtml = ref("<p></p>");
 const noteTitleDraft = ref("");
 let contentSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -718,7 +735,24 @@ function onGlobalKeydown(e: KeyboardEvent) {
     e.preventDefault();
     searchInputRef.value?.focus();
   }
+  if (
+    e.key === "Escape" &&
+    editorFocusMode.value &&
+    !textPromptOpen.value &&
+    !contextMenu.value
+  ) {
+    e.preventDefault();
+    exitEditorFocusMode();
+  }
 }
+
+watch(selectedNoteId, (id) => {
+  if (!id && editorFocusMode.value) exitEditorFocusMode();
+});
+
+watch(sidebarNav, (nav) => {
+  if (nav === "trash" && editorFocusMode.value) exitEditorFocusMode();
+});
 
 watch(selectedFolderId, async () => {
   selectedNoteId.value = null;
@@ -1294,7 +1328,11 @@ async function reorderNoteAppend(noteId: string) {
   <div class="app-root" :class="{ 'note-pointer-dragging': ptrDragNoteId }">
     <div
       class="app-columns"
-      :class="{ 'nav-collapsed': navCollapsed, 'list-collapsed': listCollapsed }"
+      :class="{
+        'nav-collapsed': navCollapsed,
+        'list-collapsed': listCollapsed,
+        'editor-focus-mode': editorFocusMode,
+      }"
     >
     <div class="col-shell col-shell--nav">
     <aside class="col-nav">
@@ -1602,31 +1640,6 @@ async function reorderNoteAppend(noteId: string) {
           废纸篓中的内容无法编辑，请恢复后再查看
         </div>
         <div v-else-if="selectedNoteId" class="main-title-row">
-          <button
-            type="button"
-            class="main-title-fav"
-            :class="{ 'main-title-fav--on': selectedNote?.isFavorite }"
-            :title="selectedNote?.isFavorite ? '取消收藏' : '收藏'"
-            :aria-pressed="selectedNote?.isFavorite"
-            aria-label="收藏"
-            @click="toggleNoteFavorite(selectedNoteId!)"
-          >
-            <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
-              <path
-                v-if="selectedNote?.isFavorite"
-                fill="currentColor"
-                d="M12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"
-              />
-              <path
-                v-else
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.8"
-                stroke-linejoin="round"
-                d="M12 17.27 18.18 21l-1.64-7.03L22 9.24l-7.19-.61L12 2 9.19 8.63 2 9.24l5.46 4.73L5.82 21z"
-              />
-            </svg>
-          </button>
           <input
             v-model="noteTitleDraft"
             class="main-title-input"
@@ -1634,6 +1647,44 @@ async function reorderNoteAppend(noteId: string) {
             placeholder="笔记标题"
             @input="onNoteTitleInput"
           />
+          <button
+            type="button"
+            class="main-title-focus"
+            :class="{ 'main-title-focus--on': editorFocusMode }"
+            :title="editorFocusMode ? '退出全屏编辑 (Esc)' : '全屏编辑'"
+            :aria-label="editorFocusMode ? '退出全屏编辑' : '全屏编辑'"
+            :aria-pressed="editorFocusMode"
+            @click="toggleEditorFocusMode"
+          >
+            <svg
+              v-if="editorFocusMode"
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M4 14h6v6M20 10h-6V4M14 20l7-7M10 4 3 11" />
+            </svg>
+            <svg
+              v-else
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+            </svg>
+          </button>
         </div>
         <div v-else class="main-title-placeholder">选择一条笔记开始编辑</div>
       </header>
@@ -1949,6 +2000,24 @@ async function reorderNoteAppend(noteId: string) {
 
 .app-columns.list-collapsed .col-splitter--list .col-splitter-chevron {
   transform: rotate(180deg);
+}
+
+.app-columns.editor-focus-mode .col-shell--nav,
+.app-columns.editor-focus-mode .col-shell--list {
+  width: 0 !important;
+  min-width: 0;
+  border-width: 0;
+  overflow: hidden;
+}
+
+.app-columns.editor-focus-mode .col-splitter--nav,
+.app-columns.editor-focus-mode .col-splitter--list {
+  width: 0;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .col-nav {
@@ -2793,6 +2862,10 @@ async function reorderNoteAppend(noteId: string) {
 
 @media (prefers-reduced-motion: reduce) {
   .col-shell,
+  .app-columns.editor-focus-mode .col-shell--nav,
+  .app-columns.editor-focus-mode .col-shell--list,
+  .app-columns.editor-focus-mode .col-splitter--nav,
+  .app-columns.editor-focus-mode .col-splitter--list,
   .col-nav-expandable,
   .col-list-inner,
   .col-splitter-chevron,
@@ -2822,29 +2895,36 @@ async function reorderNoteAppend(noteId: string) {
   width: 100%;
 }
 
-.main-title-fav {
+.main-title-focus {
   flex-shrink: 0;
-  border: none;
-  background: transparent;
+  margin-left: auto;
+  align-self: center;
+  border: 1px solid var(--line);
+  background: #f8fafc;
   cursor: pointer;
-  padding: 4px 2px;
+  padding: 8px;
   margin-top: 2px;
   color: var(--muted);
-  border-radius: 8px;
+  border-radius: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
   transition:
     color 0.12s ease,
-    background 0.12s ease;
+    background 0.12s ease,
+    border-color 0.12s ease;
 }
 
-.main-title-fav:hover {
-  background: rgba(245, 158, 11, 0.1);
+.main-title-focus:hover {
+  color: var(--accent);
+  border-color: #b8c9e8;
+  background: #fff;
 }
 
-.main-title-fav--on {
-  color: #f59e0b;
+.main-title-focus--on {
+  color: var(--accent);
+  border-color: var(--accent-soft);
+  background: var(--accent-sidebar-active);
 }
 
 @supports (-webkit-touch-callout: none) {
