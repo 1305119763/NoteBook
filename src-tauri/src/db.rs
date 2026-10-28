@@ -15,6 +15,7 @@ pub struct FolderRow {
     pub name: String,
     pub sort_order: i64,
     pub created_at: String,
+    pub color: Option<String>,
 }
 
 /// 废纸篓列表项（文件夹为一行含笔记数量；单独删除的笔记单独一行）
@@ -42,9 +43,32 @@ pub struct NoteRow {
     pub is_favorite: bool,
     /// 可统计正文字符数（排除图片/音视频/嵌入/代码块等后的纯文本，不含空白）。
     pub body_text_units: i64,
+    pub is_pinned: bool,
+    pub pinned_at: Option<String>,
     /// 列表接口不查询此列，导出时填充；序列化时省略 `None`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_html: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionMeta {
+    pub id: String,
+    pub title: String,
+    pub started_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionDetail {
+    pub id: String,
+    pub note_id: String,
+    pub title: String,
+    pub content_html: String,
+    pub started_at: String,
+    pub updated_at: String,
+    pub previous_html: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -67,6 +91,8 @@ pub struct FolderImport {
     #[serde(default)]
     pub sort_order: i64,
     pub created_at: String,
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +112,10 @@ pub struct NoteImport {
     pub is_favorite: bool,
     #[serde(default)]
     pub body_text_units: i64,
+    #[serde(default)]
+    pub is_pinned: bool,
+    #[serde(default)]
+    pub pinned_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,15 +130,47 @@ pub struct EntryImport {
     pub created_at: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionExport {
+    pub id: String,
+    pub note_id: String,
+    pub title: String,
+    pub content_html: String,
+    pub started_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevisionImport {
+    pub id: String,
+    pub note_id: String,
+    pub title: String,
+    pub content_html: String,
+    pub started_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TbookPayload {
+pub(crate) struct TbookPayload {
     format: String,
     version: u32,
     exported_at: String,
     folders: Vec<FolderRow>,
     notes: Vec<NoteRow>,
     entries: Vec<EntryRow>,
+    revisions: Vec<RevisionExport>,
+}
+
+pub(crate) struct ImportPlan {
+    folders: Vec<FolderImport>,
+    notes: Vec<NoteImport>,
+    entries: Vec<EntryImport>,
+    revisions: Vec<RevisionImport>,
+    pub media: HashMap<String, Vec<u8>>,
+    pub media_keys: Vec<String>,
 }
 
 pub fn db_path() -> Result<PathBuf, String> {
@@ -151,6 +213,20 @@ pub fn purge_expired_trash(conn: &Connection) -> Result<(), String> {
         params![cutoff_s],
     )
     .map_err(|e| e.to_string())?;
+    let rev_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'note_revisions'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if rev_table > 0 {
+        conn.execute(
+            "DELETE FROM note_revisions WHERE note_id NOT IN (SELECT id FROM notes)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -267,6 +343,54 @@ fn migrate(conn: &Connection) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
         backfill_body_text_units(conn)?;
         conn.execute("PRAGMA user_version = 7", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    let ver7: i32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if ver7 < 8 {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS note_revisions (
+                id TEXT PRIMARY KEY NOT NULL,
+                note_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content_html TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_note_revisions_note
+                ON note_revisions(note_id, started_at);
+            ",
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute("PRAGMA user_version = 8", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    let ver8: i32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if ver8 < 9 {
+        conn.execute(
+            "ALTER TABLE notes ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute("ALTER TABLE notes ADD COLUMN pinned_at TEXT", [])
+            .map_err(|e| e.to_string())?;
+        conn.execute("PRAGMA user_version = 9", [])
+            .map_err(|e| e.to_string())?;
+    }
+
+    let ver9: i32 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if ver9 < 10 {
+        conn.execute("ALTER TABLE folders ADD COLUMN color TEXT", [])
+            .map_err(|e| e.to_string())?;
+        conn.execute("PRAGMA user_version = 10", [])
             .map_err(|e| e.to_string())?;
     }
 
@@ -763,7 +887,7 @@ pub fn place_note(
 pub fn list_folders(conn: &Connection) -> Result<Vec<FolderRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, parent_id, name, sort_order, created_at FROM folders WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY sort_order, name",
+            "SELECT id, parent_id, name, sort_order, created_at, color FROM folders WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY sort_order, name",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -774,6 +898,7 @@ pub fn list_folders(conn: &Connection) -> Result<Vec<FolderRow>, String> {
                 name: r.get(2)?,
                 sort_order: r.get(3)?,
                 created_at: r.get(4)?,
+                color: r.get(5)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -822,7 +947,59 @@ pub fn create_folder(conn: &mut Connection, name: String) -> Result<FolderRow, S
         name: trimmed,
         sort_order,
         created_at: now,
+        color: None,
     })
+}
+
+pub fn set_folder_color(conn: &Connection, id: String, color: String) -> Result<(), String> {
+    let color = color.trim().to_string();
+    if color.len() != 7 || !color.starts_with('#') || !color[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("颜色格式不正确".into());
+    }
+    let n = conn
+        .execute(
+            "UPDATE folders SET color = ?1 WHERE id = ?2 AND deleted_at IS NULL",
+            params![color, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("文件夹不存在或已在废纸篓中".into());
+    }
+    Ok(())
+}
+
+pub fn place_folder(conn: &Connection, folder_id: String, before_folder_id: Option<String>) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM folders WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY sort_order, name",
+        )
+        .map_err(|e| e.to_string())?;
+    let mut ids: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+    if !ids.iter().any(|id| id == &folder_id) {
+        return Err("文件夹不存在或已在废纸篓中".into());
+    }
+    ids.retain(|id| id != &folder_id);
+    let at = match &before_folder_id {
+        None => ids.len(),
+        Some(before) => ids
+            .iter()
+            .position(|id| id == before)
+            .ok_or_else(|| "无效的插入位置".to_string())?,
+    };
+    ids.insert(at, folder_id);
+    for (index, id) in ids.iter().enumerate() {
+        conn.execute(
+            "UPDATE folders SET sort_order = ?1 WHERE id = ?2",
+            params![index as i64, id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 pub fn rename_folder(conn: &Connection, id: String, name: String) -> Result<(), String> {
@@ -876,27 +1053,33 @@ pub fn delete_folder(conn: &mut Connection, id: String) -> Result<(), String> {
     Ok(())
 }
 
+const NOTE_COLS: &str = "id, folder_id, title, preview, sort_order, created_at, updated_at, is_favorite, body_text_units, is_pinned, pinned_at";
+
+fn map_note(r: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
+    Ok(NoteRow {
+        id: r.get(0)?,
+        folder_id: r.get(1)?,
+        title: r.get(2)?,
+        preview: r.get(3)?,
+        sort_order: r.get(4)?,
+        created_at: r.get(5)?,
+        updated_at: r.get(6)?,
+        is_favorite: r.get::<_, i64>(7)? != 0,
+        body_text_units: r.get(8)?,
+        is_pinned: r.get::<_, i64>(9)? != 0,
+        pinned_at: r.get(10)?,
+        content_html: None,
+    })
+}
+
 pub fn list_notes(conn: &Connection, folder_id: String) -> Result<Vec<NoteRow>, String> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, folder_id, title, preview, sort_order, created_at, updated_at, is_favorite, body_text_units FROM notes WHERE folder_id = ?1 AND deleted_at IS NULL ORDER BY sort_order ASC, updated_at DESC",
-        )
+        .prepare(&format!(
+            "SELECT {NOTE_COLS} FROM notes WHERE folder_id = ?1 AND deleted_at IS NULL ORDER BY sort_order ASC, updated_at DESC"
+        ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![folder_id], |r| {
-            Ok(NoteRow {
-                id: r.get(0)?,
-                folder_id: r.get(1)?,
-                title: r.get(2)?,
-                preview: r.get(3)?,
-                sort_order: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
-                is_favorite: r.get::<_, i64>(7)? != 0,
-                body_text_units: r.get(8)?,
-                content_html: None,
-            })
-        })
+        .query_map(params![folder_id], map_note)
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for row in rows {
@@ -907,25 +1090,12 @@ pub fn list_notes(conn: &Connection, folder_id: String) -> Result<Vec<NoteRow>, 
 
 pub fn list_all_notes(conn: &Connection) -> Result<Vec<NoteRow>, String> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, folder_id, title, preview, sort_order, created_at, updated_at, is_favorite, body_text_units FROM notes WHERE deleted_at IS NULL ORDER BY folder_id, sort_order ASC, updated_at DESC",
-        )
+        .prepare(&format!(
+            "SELECT {NOTE_COLS} FROM notes WHERE deleted_at IS NULL ORDER BY folder_id, sort_order ASC, updated_at DESC"
+        ))
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map([], |r| {
-            Ok(NoteRow {
-                id: r.get(0)?,
-                folder_id: r.get(1)?,
-                title: r.get(2)?,
-                preview: r.get(3)?,
-                sort_order: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
-                is_favorite: r.get::<_, i64>(7)? != 0,
-                body_text_units: r.get(8)?,
-                content_html: None,
-            })
-        })
+        .query_map([], map_note)
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for row in rows {
@@ -973,6 +1143,8 @@ pub fn create_note(conn: &Connection, folder_id: String, title: String) -> Resul
         updated_at: now,
         is_favorite: false,
         body_text_units: 0,
+        is_pinned: false,
+        pinned_at: None,
         content_html: None,
     })
 }
@@ -982,31 +1154,37 @@ pub fn set_note_favorite(conn: &Connection, id: String, favorite: bool) -> Resul
     let n = conn
         .execute(
             "UPDATE notes SET is_favorite = ?1 WHERE id = ?2 AND deleted_at IS NULL",
-            params![fav, id],
+            params![fav, &id],
         )
         .map_err(|e| e.to_string())?;
     if n == 0 {
         return Err("笔记不存在或已在废纸篓中".to_string());
     }
+    load_note(conn, &id)
+}
+
+pub fn set_note_pinned(conn: &Connection, id: String, pinned: bool) -> Result<NoteRow, String> {
+    let flag: i64 = if pinned { 1 } else { 0 };
+    let pinned_at = if pinned { Some(Utc::now().to_rfc3339()) } else { None };
+    let n = conn
+        .execute(
+            "UPDATE notes SET is_pinned = ?1, pinned_at = ?2 WHERE id = ?3 AND deleted_at IS NULL",
+            params![flag, pinned_at, &id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("笔记不存在或已在废纸篓中".to_string());
+    }
+    load_note(conn, &id)
+}
+
+fn load_note(conn: &Connection, id: &str) -> Result<NoteRow, String> {
     conn.query_row(
-        "SELECT id, folder_id, title, preview, sort_order, created_at, updated_at, is_favorite, body_text_units FROM notes WHERE id = ?1 AND deleted_at IS NULL",
+        &format!("SELECT {NOTE_COLS} FROM notes WHERE id = ?1 AND deleted_at IS NULL"),
         params![id],
-        |r| {
-            Ok(NoteRow {
-                id: r.get(0)?,
-                folder_id: r.get(1)?,
-                title: r.get(2)?,
-                preview: r.get(3)?,
-                sort_order: r.get(4)?,
-                created_at: r.get(5)?,
-                updated_at: r.get(6)?,
-                is_favorite: r.get::<_, i64>(7)? != 0,
-                body_text_units: r.get(8)?,
-                content_html: None,
-            })
-        },
+        map_note,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|_| "笔记不存在或已在废纸篓中".to_string())
 }
 
 pub fn rename_note(conn: &Connection, id: String, title: String) -> Result<(), String> {
@@ -1278,7 +1456,157 @@ pub fn delete_entry(conn: &Connection, id: String, note_id: String) -> Result<()
     Ok(())
 }
 
-pub fn export_snapshot(conn: &Connection) -> Result<Vec<u8>, String> {
+const REVISION_WINDOW_SECS: i64 = 3600;
+const REVISION_KEEP: usize = 20;
+
+/// 1 小时内的编辑并入同一版本；超过则新开一条。每个笔记只留最近 20 条。
+pub fn record_note_revision(
+    conn: &Connection,
+    note_id: String,
+    title: String,
+    content_html: String,
+) -> Result<(), String> {
+    let now = Utc::now();
+    let now_s = now.to_rfc3339();
+    let latest: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT id, title, content_html, started_at FROM note_revisions WHERE note_id = ?1 ORDER BY started_at DESC LIMIT 1",
+            params![note_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    if let Some((id, old_title, old_html, started)) = latest {
+        if old_title == title && old_html == content_html {
+            return Ok(());
+        }
+        let within = chrono::DateTime::parse_from_rfc3339(&started)
+            .ok()
+            .map(|dt| {
+                let elapsed = now.signed_duration_since(dt.with_timezone(&Utc));
+                (0..REVISION_WINDOW_SECS).contains(&elapsed.num_seconds())
+                    || elapsed.num_seconds() < 0 && elapsed.num_seconds() > -5
+            })
+            .unwrap_or(false);
+        if within {
+            conn.execute(
+                "UPDATE note_revisions SET title = ?1, content_html = ?2, updated_at = ?3 WHERE id = ?4",
+                params![title, content_html, now_s, id],
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO note_revisions (id, note_id, title, content_html, started_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, note_id, title, content_html, now_s, now_s],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut stmt = conn
+        .prepare("SELECT id FROM note_revisions WHERE note_id = ?1 ORDER BY started_at DESC")
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<String> = stmt
+        .query_map(params![note_id], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if ids.len() > REVISION_KEEP {
+        for old_id in ids.iter().skip(REVISION_KEEP) {
+            conn.execute("DELETE FROM note_revisions WHERE id = ?1", params![old_id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+pub fn list_note_revisions(conn: &Connection, note_id: String) -> Result<Vec<RevisionMeta>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, started_at, updated_at FROM note_revisions WHERE note_id = ?1 ORDER BY started_at DESC LIMIT 20",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![note_id], |r| {
+            Ok(RevisionMeta {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                started_at: r.get(2)?,
+                updated_at: r.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+pub fn get_note_revision(conn: &Connection, revision_id: String) -> Result<Option<RevisionDetail>, String> {
+    let row: Option<(String, String, String, String, String, String)> = conn
+        .query_row(
+            "SELECT id, note_id, title, content_html, started_at, updated_at FROM note_revisions WHERE id = ?1",
+            params![revision_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((id, note_id, title, content_html, started_at, updated_at)) = row else {
+        return Ok(None);
+    };
+    let previous_html: Option<String> = conn
+        .query_row(
+            "SELECT content_html FROM note_revisions WHERE note_id = ?1 AND started_at < ?2 ORDER BY started_at DESC LIMIT 1",
+            params![note_id, started_at],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    Ok(Some(RevisionDetail {
+        id,
+        note_id,
+        title,
+        content_html,
+        started_at,
+        updated_at,
+        previous_html,
+    }))
+}
+
+fn list_export_revisions(conn: &Connection) -> Result<Vec<RevisionExport>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.id, r.note_id, r.title, r.content_html, r.started_at, r.updated_at
+             FROM note_revisions r
+             INNER JOIN notes n ON n.id = r.note_id
+             WHERE n.deleted_at IS NULL
+             ORDER BY r.started_at ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(RevisionExport {
+                id: r.get(0)?,
+                note_id: r.get(1)?,
+                title: r.get(2)?,
+                content_html: r.get(3)?,
+                started_at: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+pub(crate) fn load_tbook_payload(conn: &Connection) -> Result<TbookPayload, String> {
     let folders = list_folders(conn)?;
     let mut notes = list_all_notes(conn)?;
     for n in &mut notes {
@@ -1289,37 +1617,88 @@ pub fn export_snapshot(conn: &Connection) -> Result<Vec<u8>, String> {
         let mut e = list_entries(conn, n.id.clone())?;
         entries.append(&mut e);
     }
-    let payload = TbookPayload {
+    let revisions = list_export_revisions(conn)?;
+    Ok(TbookPayload {
         format: "tbook".to_string(),
-        version: 1,
+        version: 2,
         exported_at: Utc::now().to_rfc3339(),
         folders,
         notes,
         entries,
-    };
-    let json = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
+        revisions,
+    })
+}
+
+pub(crate) fn tbook_payload_bytes(payload: &TbookPayload, media: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
+    let json = serde_json::to_vec_pretty(payload).map_err(|e| e.to_string())?;
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         use std::io::Write;
         use zip::write::FileOptions;
         let mut zip = zip::ZipWriter::new(&mut buf);
         let opts = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file("data.json", opts)
-            .map_err(|e| e.to_string())?;
+        zip.start_file("data.json", opts).map_err(|e| e.to_string())?;
         zip.write_all(&json).map_err(|e| e.to_string())?;
+        for (name, bytes) in media {
+            if !crate::media::safe_media_name(name) {
+                return Err(format!("无效的媒体文件名: {name}"));
+            }
+            zip.start_file(format!("media/{name}"), opts)
+                .map_err(|e| e.to_string())?;
+            zip.write_all(bytes).map_err(|e| e.to_string())?;
+        }
         zip.finish().map_err(|e| e.to_string())?;
     }
     Ok(buf.into_inner())
 }
 
-pub fn import_replace(conn: &Connection, data: &[u8]) -> Result<(), String> {
+pub(crate) fn collect_payload_media_keys(payload: &TbookPayload) -> Vec<String> {
+    let mut keys = Vec::new();
+    for note in &payload.notes {
+        if let Some(html) = &note.content_html {
+            keys.extend(crate::media::collect_media_keys_from_html(html));
+        }
+    }
+    for entry in &payload.entries {
+        keys.extend(crate::media::collect_media_keys_from_html(&entry.body));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+pub(crate) fn apply_media_renames(payload: &mut TbookPayload, renames: &HashMap<String, String>) {
+    for note in &mut payload.notes {
+        if let Some(html) = note.content_html.as_mut() {
+            *html = crate::media::canonicalize_media_html(html, renames);
+        }
+    }
+}
+
+pub fn export_snapshot(conn: &Connection) -> Result<Vec<u8>, String> {
+    let payload = load_tbook_payload(conn)?;
+    tbook_payload_bytes(&payload, &[])
+}
+
+pub(crate) fn plan_import(data: &[u8]) -> Result<ImportPlan, String> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data)).map_err(|e| e.to_string())?;
     let mut json_bytes = Vec::new();
+    let mut media = HashMap::new();
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        if file.name() == "data.json" {
+        if file.is_dir() {
+            continue;
+        }
+        let name = file.name().replace('\\', "/");
+        if name == "data.json" {
             std::io::Read::read_to_end(&mut file, &mut json_bytes).map_err(|e| e.to_string())?;
-            break;
+        } else if let Some(key) = name.strip_prefix("media/") {
+            if !crate::media::safe_media_name(key) {
+                continue;
+            }
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut buf).map_err(|e| e.to_string())?;
+            media.insert(key.to_string(), buf);
         }
     }
     if json_bytes.is_empty() {
@@ -1347,6 +1726,10 @@ pub fn import_replace(conn: &Connection, data: &[u8]) -> Result<(), String> {
             .ok_or_else(|| "缺少 entries".to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    let revisions = match v.get("revisions") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(raw) => serde_json::from_value::<Vec<RevisionImport>>(raw.clone()).map_err(|e| e.to_string())?,
+    };
 
     let folder_ids: HashSet<String> = folders.iter().map(|f| f.id.clone()).collect();
     for n in &notes {
@@ -1360,14 +1743,40 @@ pub fn import_replace(conn: &Connection, data: &[u8]) -> Result<(), String> {
             return Err(format!("条目引用了不存在的笔记 {}", e.note_id));
         }
     }
+    for rev in &revisions {
+        if !note_ids.contains(&rev.note_id) {
+            return Err(format!("历史版本引用了不存在的笔记 {}", rev.note_id));
+        }
+    }
+    folder_insert_order(&folders)?;
 
-    conn.execute_batch("PRAGMA foreign_keys = OFF; DELETE FROM entries; DELETE FROM notes; DELETE FROM folders; PRAGMA foreign_keys = ON;")
-        .map_err(|e| e.to_string())?;
+    let mut media_keys = Vec::new();
+    for n in &notes {
+        if let Some(html) = &n.content_html {
+            media_keys.extend(crate::media::collect_media_keys_from_html(html));
+        }
+    }
+    for e in &entries {
+        media_keys.extend(crate::media::collect_media_keys_from_html(&e.body));
+    }
+    media_keys.sort();
+    media_keys.dedup();
 
+    Ok(ImportPlan {
+        folders,
+        notes,
+        entries,
+        revisions,
+        media,
+        media_keys,
+    })
+}
+
+fn folder_insert_order(folders: &[FolderImport]) -> Result<Vec<String>, String> {
     let mut pending: HashSet<String> = folders.iter().map(|f| f.id.clone()).collect();
     let by_id: HashMap<String, &FolderImport> = folders.iter().map(|f| (f.id.clone(), f)).collect();
     let mut inserted: HashSet<String> = HashSet::new();
-
+    let mut order = Vec::new();
     while !pending.is_empty() {
         let mut batch = Vec::new();
         for id in &pending {
@@ -1384,60 +1793,187 @@ pub fn import_replace(conn: &Connection, data: &[u8]) -> Result<(), String> {
             return Err("文件夹层级存在循环或无效的 parent_id".to_string());
         }
         for id in &batch {
-            let f = by_id.get(id).unwrap();
-            conn.execute(
-                "INSERT INTO folders (id, parent_id, name, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![f.id, f.parent_id.clone(), f.name, f.sort_order, f.created_at],
-            )
-            .map_err(|e| e.to_string())?;
             inserted.insert(id.clone());
             pending.remove(id);
+            order.push(id.clone());
         }
     }
+    Ok(order)
+}
 
-    for n in &notes {
-        let fav: i64 = if n.is_favorite { 1 } else { 0 };
-        let bu = if n.body_text_units > 0 {
-            n.body_text_units
-        } else if let Some(ref h) = n.content_html.as_ref().filter(|s| !s.trim().is_empty()) {
-            count_stat_text_from_html(h)
-        } else {
-            0i64
+pub fn import_replace(conn: &mut Connection, plan: &ImportPlan) -> Result<(), String> {
+    let folders = &plan.folders;
+    let notes = &plan.notes;
+    let entries = &plan.entries;
+    let revisions = &plan.revisions;
+    let order = folder_insert_order(folders)?;
+    let by_id: HashMap<String, &FolderImport> = folders.iter().map(|f| (f.id.clone(), f)).collect();
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")
+        .map_err(|e| e.to_string())?;
+    let write = (|| -> Result<(), String> {
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute_batch(
+            "DELETE FROM entries; DELETE FROM note_revisions; DELETE FROM notes; DELETE FROM folders;",
+        )
+        .map_err(|e| e.to_string())?;
+
+        for id in &order {
+            let f = by_id.get(id).unwrap();
+            tx.execute(
+                "INSERT INTO folders (id, parent_id, name, sort_order, created_at, color) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![f.id, f.parent_id.clone(), f.name, f.sort_order, f.created_at, f.color.clone()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        for n in notes {
+            let fav: i64 = if n.is_favorite { 1 } else { 0 };
+            let pinned: i64 = if n.is_pinned { 1 } else { 0 };
+            let pinned_at = if n.is_pinned {
+                n.pinned_at.clone().or_else(|| Some(n.updated_at.clone()))
+            } else {
+                None
+            };
+            let bu = if n.body_text_units > 0 {
+                n.body_text_units
+            } else if let Some(h) = n.content_html.as_ref().filter(|s| !s.trim().is_empty()) {
+                count_stat_text_from_html(h)
+            } else {
+                0i64
+            };
+            tx.execute(
+                "INSERT INTO notes (id, folder_id, title, preview, sort_order, created_at, updated_at, content_html, is_favorite, body_text_units, is_pinned, pinned_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    n.id,
+                    n.folder_id,
+                    n.title,
+                    n.preview.clone(),
+                    n.sort_order,
+                    n.created_at,
+                    n.updated_at,
+                    n.content_html.clone(),
+                    fav,
+                    bu,
+                    pinned,
+                    pinned_at,
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        for e in entries {
+            tx.execute(
+                "INSERT INTO entries (id, note_id, title, body, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![e.id, e.note_id, e.title, e.body, e.sort_order, e.created_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        for rev in revisions {
+            tx.execute(
+                "INSERT INTO note_revisions (id, note_id, title, content_html, started_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![rev.id, rev.note_id, rev.title, rev.content_html, rev.started_at, rev.updated_at],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        normalize_two_level_after_import(&tx)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    let _ = conn.execute_batch("PRAGMA foreign_keys = ON;");
+    write
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_temp(name: &str) -> (std::path::PathBuf, Connection) {
+        let dir = std::env::temp_dir().join(format!("notebook-import-{name}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("n.db")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&conn).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn export_then_import_keeps_content_pin_history_and_media() {
+        let (dir, conn) = open_temp("round");
+        let folder_id = list_folders(&conn).unwrap()[0].id.clone();
+        let note = create_note(&conn, folder_id, "标题".into()).unwrap();
+        set_note_content(&conn, note.id.clone(), r#"<p>正文</p><img src="notebook-media://pic.png">"#.into()).unwrap();
+        set_note_favorite(&conn, note.id.clone(), true).unwrap();
+        set_note_pinned(&conn, note.id.clone(), true).unwrap();
+        add_entry(&conn, note.id.clone(), "条目".into(), "条目正文".into()).unwrap();
+        record_note_revision(&conn, note.id.clone(), "标题".into(), "<p>旧稿</p>".into()).unwrap();
+
+        let payload = load_tbook_payload(&conn).unwrap();
+        let bytes = tbook_payload_bytes(&payload, &[("pic.png".into(), b"PNG".to_vec())]).unwrap();
+        drop(conn);
+
+        let (_dir2, mut conn2) = open_temp("round2");
+        let plan = plan_import(&bytes).unwrap();
+        assert_eq!(plan.media.get("pic.png").map(|b| b.as_slice()), Some(b"PNG".as_slice()));
+        assert!(plan.media_keys.iter().any(|k| k == "pic.png"));
+        import_replace(&mut conn2, &plan).unwrap();
+
+        let notes = list_all_notes(&conn2).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "标题");
+        assert!(notes[0].is_favorite);
+        assert!(notes[0].is_pinned);
+        assert!(notes[0].pinned_at.is_some());
+        let html = get_note_content(&conn2, &notes[0].id).unwrap().unwrap();
+        assert!(html.contains("正文"));
+        assert!(html.contains("notebook-media://pic.png"));
+        let entries = list_entries(&conn2, notes[0].id.clone()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].body, "条目正文");
+        let revs = list_note_revisions(&conn2, notes[0].id.clone()).unwrap();
+        assert_eq!(revs.len(), 1);
+        let detail = get_note_revision(&conn2, revs[0].id.clone()).unwrap().unwrap();
+        assert!(detail.content_html.contains("旧稿"));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(_dir2);
+    }
+
+    #[test]
+    fn failed_import_does_not_wipe_existing_notes() {
+        let (dir, mut conn) = open_temp("keep");
+        let folder_id = list_folders(&conn).unwrap()[0].id.clone();
+        create_note(&conn, folder_id, "留下来".into()).unwrap();
+        let json = r#"{
+            "format":"tbook",
+            "version":2,
+            "exportedAt":"2026-01-01T00:00:00Z",
+            "folders":[
+                {"id":"f1","parentId":null,"name":"同名","sortOrder":0,"createdAt":"2026-01-01T00:00:00Z"},
+                {"id":"f2","parentId":null,"name":"同名","sortOrder":1,"createdAt":"2026-01-01T00:00:00Z"}
+            ],
+            "notes":[],
+            "entries":[]
+        }"#;
+        let bytes = {
+            use std::io::Write;
+            use zip::write::FileOptions;
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zip = zip::ZipWriter::new(&mut buf);
+                zip.start_file("data.json", FileOptions::default()).unwrap();
+                zip.write_all(json.as_bytes()).unwrap();
+                zip.finish().unwrap();
+            }
+            buf.into_inner()
         };
-        conn.execute(
-            "INSERT INTO notes (id, folder_id, title, preview, sort_order, created_at, updated_at, content_html, is_favorite, body_text_units) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                n.id,
-                n.folder_id,
-                n.title,
-                n.preview.clone(),
-                n.sort_order,
-                n.created_at,
-                n.updated_at,
-                n.content_html.clone(),
-                fav,
-                bu,
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+        let plan = plan_import(&bytes).unwrap();
+        let err = import_replace(&mut conn, &plan).unwrap_err();
+        assert!(err.contains("UNIQUE") || err.contains("unique") || err.contains("同名") || !err.is_empty());
+        let notes = list_all_notes(&conn).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "留下来");
+        let _ = fs::remove_dir_all(dir);
     }
-
-    for e in &entries {
-        conn.execute(
-            "INSERT INTO entries (id, note_id, title, body, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                e.id,
-                e.note_id,
-                e.title,
-                e.body,
-                e.sort_order,
-                e.created_at
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    }
-
-    normalize_two_level_after_import(conn)?;
-
-    Ok(())
 }

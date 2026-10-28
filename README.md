@@ -68,7 +68,7 @@ npm run build:win
 
 ### 应用图标
 
-打包用图标由 **`src/assets/notebook-logo.png`** 经 `npm run icons:rebuild` 在本地裁切为正方形、缩放至 1024 后调用 `tauri icon` 生成（中间文件在系统临时目录，不提交仓库）。
+打包用图标由 **`public/screen.png`** 经 `npm run icons:rebuild` 在本地裁切为正方形、缩放至 1024 后调用 `tauri icon` 生成（中间文件在系统临时目录，不提交仓库）。
 
 **若 macOS 程序坞里图标四角出现「棋盘格」或方形白底**：那是导出 PNG 时把设计软件里表示透明的棋盘格**栅格化进了像素**（假透明），系统会当真颜色画出来。请换成**带 Alpha 通道、四角无杂色**的源图，然后在项目根目录执行：
 
@@ -76,11 +76,9 @@ npm run build:win
 npm run icons:rebuild
 ```
 
-该命令会：用脚本从四角 flood-fill 清除典型浅灰/白假背景 → 裁正方形 → `tauri icon` 生成 `src-tauri/icons/*` → 同步 `public/logo.png` 与 `docs/readme-hero.png`。
+该命令会：裁正方形 → `tauri icon` 生成 `src-tauri/icons/*` → 同步 `docs/readme-hero.png`。界面内 logo 直接使用 `public/screen.png`。
 
-仅做透明修正时可：`npm run icons:normalize`（默认处理 `notebook-logo.png`）。需要重新出安装包图标时再执行 `npm run icons:rebuild`。
-
-`docs/readme-hero.png` 与 `notebook-logo.png` 一致，由重建脚本覆盖，供 README 配图。
+`docs/readme-hero.png` 与 `public/screen.png` 一致，由重建脚本覆盖，供 README 配图。
 
 ## 数据存储
 

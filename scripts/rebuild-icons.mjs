@@ -1,5 +1,5 @@
 /**
- * 从 src/assets/notebook-logo.png 裁正方形并缩放至 1024，写入临时文件后调用 tauri icon（需 macOS + sips）。
+ * 从 public/screen.png 裁正方形并缩放至 1024，写入临时文件后调用 tauri icon（需 macOS + sips）。
  */
 import { execSync } from "node:child_process";
 import fs from "node:fs";
@@ -15,7 +15,7 @@ if (process.platform !== "darwin") {
   process.exit(1);
 }
 
-const logoSrc = path.join(root, "src/assets/notebook-logo.png");
+const logoSrc = path.join(root, "public/screen.png");
 const tmpCrop = path.join(os.tmpdir(), `nb-icon-crop-${Date.now()}.png`);
 const tmp1024 = path.join(os.tmpdir(), `nb-icon-1024-${Date.now()}.png`);
 
@@ -44,14 +44,10 @@ try {
     stdio: "inherit",
   });
 
-  const pub = path.join(root, "public/logo.png");
-  const i128 = path.join(root, "src-tauri/icons/128x128.png");
-  fs.copyFileSync(i128, pub);
-
   const hero = path.join(root, "docs/readme-hero.png");
   fs.copyFileSync(logoSrc, hero);
 
-  console.log("完成：src-tauri/icons/*、public/logo.png、docs/readme-hero.png");
+  console.log("完成：src-tauri/icons/*、docs/readme-hero.png");
 } finally {
   for (const p of [tmpCrop, tmp1024]) {
     try {

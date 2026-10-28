@@ -94,7 +94,8 @@ function pickSort(mode: ListSortMode) {
   height: 36px;
   border: none;
   border-radius: 10px;
-  background: rgba(255, 255, 255, 0.75);
+  background: var(--field, rgba(255, 255, 255, 0.75));
+  border: 1px solid var(--field-line, transparent);
   color: var(--muted);
   cursor: pointer;
   display: flex;
@@ -119,7 +120,8 @@ function pickSort(mode: ListSortMode) {
   z-index: 50;
   min-width: 220px;
   padding: 10px 0;
-  background: #fff;
+  background: var(--surface, #fff);
+  color: var(--surface-text, #111827);
   border: 1px solid var(--line);
   border-radius: 12px;
   box-shadow: 0 8px 28px rgba(15, 23, 42, 0.12);
@@ -136,7 +138,7 @@ function pickSort(mode: ListSortMode) {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: #9ca3af;
+  color: var(--muted, #9ca3af);
   padding: 4px 12px 6px;
 }
 
@@ -187,7 +189,7 @@ function pickSort(mode: ListSortMode) {
   padding: 0 14px 4px;
   font-size: 11px;
   line-height: 1.45;
-  color: #9ca3af;
+  color: var(--muted, #9ca3af);
 }
 
 .lfm-fade-enter-active,

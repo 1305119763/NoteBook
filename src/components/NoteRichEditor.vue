@@ -6,7 +6,6 @@ import Placeholder from "@tiptap/extension-placeholder";
 import Link from "@tiptap/extension-link";
 import Underline from "@tiptap/extension-underline";
 import StarterKit from "@tiptap/starter-kit";
-import Image from "@tiptap/extension-image";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -14,6 +13,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { PhysicalPosition } from "@tauri-apps/api/dpi";
 import { open } from "@tauri-apps/plugin-dialog";
 import { Video } from "../extensions/Video";
+import { ResizableImage } from "../extensions/resizableImage";
+import { CollabMark, FontSize, HighlightMark, TextColor } from "../extensions/textMarks";
+import ColorMenu from "./ColorMenu.vue";
+import { FONT_SIZES } from "../utils/palette";
+import { primeMediaInHtml, rememberMedia } from "../utils/mediaSrc";
 
 const props = defineProps<{
   modelValue: string;
@@ -61,6 +65,8 @@ const linkHover = ref({
 });
 
 const HEADING_LEVELS = [1, 2, 3, 4, 5, 6] as const;
+const toolbarTick = ref(0);
+let mediaToken = 0;
 
 let dragPreviewObjectUrl: string | null = null;
 let linkHoverHideTimer: ReturnType<typeof setTimeout> | null = null;
@@ -309,7 +315,11 @@ const editor = useEditor({
     Placeholder.configure({
       placeholder: "在此处输入正文…",
     }),
-    Image.configure({
+    TextColor,
+    FontSize,
+    HighlightMark,
+    CollabMark,
+    ResizableImage.configure({
       allowBase64: false,
       HTMLAttributes: {
         class: "notebook-inline-media",
@@ -376,16 +386,28 @@ const editor = useEditor({
   onUpdate: ({ editor: ed }) => {
     emit("update:modelValue", ed.getHTML());
   },
+  onTransaction: () => {
+    toolbarTick.value += 1;
+  },
 });
+
+async function syncEditorContent(html: string | undefined) {
+  const ed = editor.value;
+  if (!ed) return;
+  const next = html?.trim() ? html : "<p></p>";
+  if (ed.getHTML() === next) return;
+  const token = ++mediaToken;
+  await primeMediaInHtml(next);
+  if (token !== mediaToken) return;
+  const current = editor.value;
+  if (!current || current.getHTML() === next) return;
+  current.commands.setContent(next, { emitUpdate: false });
+}
 
 watch(
   () => props.modelValue,
   (html) => {
-    const ed = editor.value;
-    if (!ed) return;
-    const next = html?.trim() ? html : "<p></p>";
-    if (ed.getHTML() === next) return;
-    ed.commands.setContent(next, { emitUpdate: false });
+    void syncEditorContent(html);
   },
 );
 
@@ -402,6 +424,7 @@ watch(
 );
 
 onMounted(() => {
+  void syncEditorContent(props.modelValue);
   void getCurrentWindow()
     .scaleFactor()
     .then((factor) => {
@@ -449,10 +472,11 @@ async function handleFiles(files: File[]) {
         extension: kind.ext,
       }) as { mediaSrc: string; storageKey: string; absolutePath: string };
 
+      rememberMedia(result.storageKey, result.absolutePath);
       if (kind.isImage) {
-        ed.chain().focus().setImage({ src: convertFileSrc(result.absolutePath) }).run();
+        ed.chain().focus().setImage({ src: result.mediaSrc }).run();
       } else {
-        ed.chain().focus().setVideo({ src: convertFileSrc(result.absolutePath) }).run();
+        ed.chain().focus().setVideo({ src: result.mediaSrc }).run();
       }
     } catch (e) {
       console.error("媒体导入失败:", e);
@@ -503,10 +527,11 @@ async function importFromPaths(paths: string[]) {
       const ext = filePath.split(".").pop()?.toLowerCase() || "";
       const isImage = ALLOWED_IMAGE_EXTS.includes(ext);
 
+      rememberMedia(result.storageKey, result.absolutePath);
       if (isImage) {
-        ed.chain().focus().setImage({ src: convertFileSrc(result.absolutePath) }).run();
+        ed.chain().focus().setImage({ src: result.mediaSrc }).run();
       } else {
-        ed.chain().focus().setVideo({ src: convertFileSrc(result.absolutePath) }).run();
+        ed.chain().focus().setVideo({ src: result.mediaSrc }).run();
       }
     } catch (e) {
       console.error("媒体导入失败:", e);
@@ -543,6 +568,46 @@ function tbLiftListDisabled(): boolean {
 
 function clearFormatting() {
   editor.value?.chain().focus().unsetAllMarks().clearNodes().run();
+}
+
+const currentTextColor = computed(() => {
+  toolbarTick.value;
+  const raw = editor.value?.getAttributes("textColor")?.color as string | undefined;
+  return raw || null;
+});
+
+const currentBackColor = computed(() => {
+  toolbarTick.value;
+  const raw = editor.value?.getAttributes("highlight")?.color as string | undefined;
+  return raw || null;
+});
+
+const currentFontSize = computed(() => {
+  toolbarTick.value;
+  const raw = editor.value?.getAttributes("fontSize")?.size as string | undefined;
+  return raw ? raw.replace(/px$/i, "") : "";
+});
+
+function onFontSizeChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  const ed = editor.value;
+  if (!ed) return;
+  if (!value) ed.chain().focus().unsetFontSize().run();
+  else ed.chain().focus().setFontSize(`${value}px`).run();
+}
+
+function setTextColor(color: string | null) {
+  const ed = editor.value;
+  if (!ed) return;
+  if (!color) ed.chain().focus().unsetTextColor().run();
+  else ed.chain().focus().setTextColor(color).run();
+}
+
+function setBackColor(color: string | null) {
+  const ed = editor.value;
+  if (!ed) return;
+  if (!color) ed.chain().focus().unsetHighlight().run();
+  else ed.chain().focus().setHighlight(color).run();
 }
 
 function normalizeHref(raw: string): string {
@@ -800,6 +865,28 @@ function onLinkHoverLeave() {
       >
         <s>S</s>
       </button>
+      <select
+        class="rte-font-size"
+        :disabled="tbDisabled()"
+        title="文字大小"
+        :value="currentFontSize"
+        @change="onFontSizeChange"
+      >
+        <option value="">字号</option>
+        <option v-for="size in FONT_SIZES" :key="size" :value="String(size)">{{ size }}</option>
+      </select>
+      <ColorMenu
+        kind="text"
+        :disabled="tbDisabled()"
+        :current="currentTextColor"
+        @pick="setTextColor"
+      />
+      <ColorMenu
+        kind="back"
+        :disabled="tbDisabled()"
+        :current="currentBackColor"
+        @pick="setBackColor"
+      />
       <button
         type="button"
         class="rte-tb-btn"
@@ -1087,7 +1174,7 @@ function onLinkHoverLeave() {
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  background: #fafbfc;
+  background: var(--paper, #fafbfc);
 }
 
 .rte-toolbar {
@@ -1097,20 +1184,20 @@ function onLinkHoverLeave() {
   gap: 5px;
   padding: 8px 14px;
   border-bottom: 1px solid var(--line, #e8eaed);
-  background: #fff;
+  background: var(--toolbar, #fff);
   flex-shrink: 0;
   row-gap: 6px;
 }
 
 .rte-tb-btn {
   border: 1px solid transparent;
-  background: #f0f2f5;
+  background: var(--chip, #f0f2f5);
   border-radius: 6px;
   padding: 5px 9px;
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
-  color: #333;
+  color: var(--chip-text, #333);
   font-family: inherit;
   line-height: 1.2;
   white-space: nowrap;
@@ -1157,8 +1244,9 @@ function onLinkHoverLeave() {
   z-index: 200;
   width: 300px;
   padding: 14px 14px 12px;
-  background: #fff;
-  border: 1px solid #e5e7eb;
+  background: var(--surface, #fff);
+  color: var(--surface-text, #111827);
+  border: 1px solid var(--line, #e5e7eb);
   border-radius: 12px;
   box-shadow:
     0 8px 30px rgba(15, 23, 42, 0.12),
@@ -1169,7 +1257,7 @@ function onLinkHoverLeave() {
   margin: 0 0 10px;
   font-size: 13px;
   font-weight: 700;
-  color: #111827;
+  color: var(--surface-text, #111827);
 }
 
 .rte-link-field {
@@ -1182,18 +1270,19 @@ function onLinkHoverLeave() {
 .rte-link-field-label {
   font-size: 12px;
   font-weight: 600;
-  color: #6b7280;
+  color: var(--surface-muted, #6b7280);
 }
 
 .rte-link-field-input {
   width: 100%;
   box-sizing: border-box;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--line, #e5e7eb);
   border-radius: 8px;
   padding: 8px 10px;
   font-size: 13px;
   font-family: inherit;
-  color: #111827;
+  background: var(--field, #fff);
+  color: var(--text, #111827);
   outline: none;
   transition: border-color 0.15s ease;
 }
@@ -1203,8 +1292,8 @@ function onLinkHoverLeave() {
 }
 
 .rte-link-field-input--readonly {
-  background: #f9fafb;
-  color: #374151;
+  background: var(--chip, #f9fafb);
+  color: var(--muted, #374151);
   cursor: default;
 }
 
@@ -1220,19 +1309,20 @@ function onLinkHoverLeave() {
 }
 
 .rte-link-action {
-  border: 1px solid #e5e7eb;
-  background: #fff;
+  border: 1px solid var(--line, #e5e7eb);
+  background: var(--chip, #fff);
+  color: var(--chip-text, #374151);
   border-radius: 8px;
   padding: 6px 12px;
   font-size: 12px;
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
-  color: #374151;
+  color: var(--chip-text, #374151);
 }
 
 .rte-link-action:hover {
-  background: #f9fafb;
+  background: var(--chip-hover, #f9fafb);
 }
 
 .rte-link-action--primary {
@@ -1262,22 +1352,22 @@ function onLinkHoverLeave() {
   display: flex;
   gap: 4px;
   padding: 4px;
-  background: #fff;
-  border: 1px solid #e5e7eb;
+  background: var(--surface, #fff);
+  border: 1px solid var(--line, #e5e7eb);
   border-radius: 10px;
   box-shadow: 0 4px 16px rgba(15, 23, 42, 0.12);
 }
 
 .rte-link-hover-btn {
   border: none;
-  background: #f3f4f6;
+  background: var(--chip, #f3f4f6);
+  color: var(--chip-text, #374151);
   border-radius: 7px;
   padding: 5px 12px;
   font-size: 12px;
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
-  color: #374151;
   white-space: nowrap;
 }
 
@@ -1287,7 +1377,7 @@ function onLinkHoverLeave() {
 }
 
 .rte-tb-btn:hover:not(:disabled) {
-  background: #e4e6ea;
+  background: var(--chip-hover, #e4e6ea);
 }
 
 .rte-tb-btn:disabled {
@@ -1361,7 +1451,7 @@ function onLinkHoverLeave() {
   margin: 0;
   font-size: 14px;
   font-weight: 600;
-  color: #1f2937;
+  color: var(--text, #1f2937);
   word-break: break-all;
 }
 
@@ -1401,7 +1491,7 @@ function onLinkHoverLeave() {
   align-items: flex-start;
   justify-content: center;
   padding-top: 48px;
-  background: #fafbfc;
+  background: var(--paper, #fafbfc);
   z-index: 1;
 }
 
@@ -1419,24 +1509,28 @@ function onLinkHoverLeave() {
   outline: none;
   font-size: 15px;
   line-height: 1.65;
-  color: #111827;
-  font-family:
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    Roboto,
-    "Helvetica Neue",
-    Arial,
-    "PingFang SC",
-    "Hiragino Sans GB",
-    "Microsoft YaHei",
-    sans-serif;
+  color: var(--text, #111827);
+  font-family: var(--font);
 }
 
 :deep(.note-editor-prosemirror p) {
   margin: 0 0 0.6em;
+}
+
+:deep(.note-editor-prosemirror table) {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0 0 0.8em;
+}
+
+:deep(.note-editor-prosemirror th),
+:deep(.note-editor-prosemirror td) {
+  border: 1px solid var(--line, #e5e7eb);
+  padding: 6px 8px;
+}
+
+:deep(.note-editor-prosemirror th) {
+  background: var(--chip, #f3f4f6);
 }
 
 :deep(.note-editor-prosemirror h1) {
@@ -1470,7 +1564,7 @@ function onLinkHoverLeave() {
   font-size: 0.95em;
   margin: 0.55em 0 0.25em;
   font-weight: 700;
-  color: #4b5563;
+  color: var(--muted, #4b5563);
 }
 
 :deep(.note-editor-prosemirror ul),
@@ -1482,12 +1576,13 @@ function onLinkHoverLeave() {
 :deep(.note-editor-prosemirror blockquote) {
   margin: 0 0 0.6em;
   padding-left: 12px;
-  border-left: 3px solid #c5cad3;
-  color: #444;
+  border-left: 3px solid var(--quote-bar, #c5cad3);
+  color: var(--quote, #444);
 }
 
 :deep(.note-editor-prosemirror code) {
-  background: #f3f4f6;
+  background: var(--code-bg, #f3f4f6);
+  color: inherit;
   padding: 0.12em 0.35em;
   border-radius: 4px;
   font-size: 0.9em;
@@ -1514,7 +1609,7 @@ function onLinkHoverLeave() {
 
 :deep(.note-editor-prosemirror hr) {
   border: none;
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--line, #e5e7eb);
   margin: 1em 0;
 }
 
@@ -1525,7 +1620,7 @@ function onLinkHoverLeave() {
 }
 
 :deep(.note-editor-prosemirror p.is-editor-empty:first-child::before) {
-  color: #adb5bd;
+  color: var(--muted, #adb5bd);
   content: attr(data-placeholder);
   float: left;
   height: 0;
@@ -1538,6 +1633,63 @@ function onLinkHoverLeave() {
   border-radius: 8px;
   margin: 8px 0;
   display: block;
+}
+
+:deep(.nb-resizable-image) {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  line-height: 0;
+  margin: 8px 0;
+}
+
+:deep(.nb-resizable-image img.notebook-inline-media) {
+  margin: 0;
+}
+
+:deep(.nb-resizable-image.is-selected img) {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+}
+
+:deep(.nb-resize-handle) {
+  display: none;
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  background: #fff;
+  border: 2px solid #2563eb;
+  border-radius: 2px;
+  z-index: 2;
+}
+
+:deep(.nb-resizable-image.is-selected .nb-resize-handle) {
+  display: block;
+}
+
+:deep(.nb-resize-handle--nw) { top: -5px; left: -5px; cursor: nwse-resize; }
+:deep(.nb-resize-handle--se) { bottom: -5px; right: -5px; cursor: nwse-resize; }
+:deep(.nb-resize-handle--ne) { top: -5px; right: -5px; cursor: nesw-resize; }
+:deep(.nb-resize-handle--sw) { bottom: -5px; left: -5px; cursor: nesw-resize; }
+
+:deep(.note-editor-prosemirror mark) {
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+:deep(.note-editor-prosemirror .nb-collab) {
+  border-radius: 2px;
+}
+
+.rte-font-size {
+  height: 28px;
+  border: 1px solid var(--line, #e5e7eb);
+  border-radius: 6px;
+  background: var(--field, #fff);
+  color: var(--text, #374151);
+  font-size: 12px;
+  padding: 0 4px;
 }
 
 

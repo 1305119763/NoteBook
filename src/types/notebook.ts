@@ -4,6 +4,7 @@ export type FolderRow = {
   name: string;
   sortOrder: number;
   createdAt: string;
+  color?: string | null;
 };
 
 export type NoteRow = {
@@ -17,6 +18,8 @@ export type NoteRow = {
   isFavorite: boolean;
   /** 可统计正文字数（后端 body_text_units，不含空白） */
   bodyTextUnits: number;
+  isPinned: boolean;
+  pinnedAt: string | null;
 };
 
 export type TrashItemRow = {

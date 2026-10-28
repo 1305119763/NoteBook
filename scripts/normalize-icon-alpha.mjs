@@ -3,6 +3,7 @@
  * 只认近似无彩的灰（RGB 接近），避免吃掉主体里的彩色；与边框不连通的内部像素不会变。
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { PNG } from "pngjs";
@@ -72,7 +73,7 @@ function normalizePngFile(inputPath, outputPath) {
 }
 
 const root = path.resolve(__dirname, "..");
-const input = process.argv[2] || path.join(root, "src/assets/notebook-logo.png");
-const out = process.argv[3] || path.join(root, "src/assets/notebook-logo.png");
+const input = process.argv[2] || path.join(root, "public/screen.png");
+const out = process.argv[3] || path.join(os.tmpdir(), "notebook-logo-normalized.png");
 normalizePngFile(input, out);
 console.log("Wrote", out);

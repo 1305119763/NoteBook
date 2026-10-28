@@ -103,13 +103,14 @@ const emit = defineEmits<{
 }
 
 .trash-row:hover {
-  background: rgba(255, 255, 255, 0.72);
-  border-color: #c5d0e0;
+  background: var(--card-hover, rgba(255, 255, 255, 0.72));
+  border-color: var(--card-line, #c5d0e0);
 }
 
 .trash-row.active {
-  background: #fff;
-  border-color: #b8c5d8;
+  background: var(--card-active, #fff);
+  border-color: var(--accent, #b8c5d8);
+  color: var(--text, inherit);
   box-shadow: 0 4px 18px rgba(15, 23, 42, 0.1);
 }
 
@@ -147,6 +148,7 @@ const emit = defineEmits<{
 .note-title {
   font-weight: 700;
   font-size: 14px;
+  color: var(--text, inherit);
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;

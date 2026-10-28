@@ -9,12 +9,16 @@ import {
   TransitionGroup,
 } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ask, confirm, message, open, save } from "@tauri-apps/plugin-dialog";
 import AppBrand from "./components/AppBrand.vue";
+import SettingsDialog, { type AppSettings } from "./components/SettingsDialog.vue";
 import ListFilterMenu from "./components/ListFilterMenu.vue";
 import NoteRichEditor from "./components/NoteRichEditor.vue";
+import HistoryDrawer from "./components/HistoryDrawer.vue";
+import PresentPanel from "./components/PresentPanel.vue";
 import TrashList from "./components/TrashList.vue";
-import { TRASH_RETENTION_DAYS } from "./constants/appMeta";
+import { APP_DISPLAY_VERSION, TRASH_RETENTION_DAYS } from "./constants/appMeta";
 import type {
   FolderRow,
   ListSortMode,
@@ -34,6 +38,65 @@ const selectedTrashKey = ref<string | null>(null);
 
 /** 左侧主导航 */
 const sidebarNav = ref<SidebarNav>("all");
+
+const settings = ref<AppSettings>({
+  theme: "system",
+  skin: "blue",
+  nickname: "",
+  useDefaultNames: false,
+});
+const settingsPath = ref("");
+const settingsOpen = ref(false);
+const settingsFocus = ref<"general" | "about">("general");
+const systemDark = ref(window.matchMedia("(prefers-color-scheme: dark)").matches);
+const resolvedTheme = computed(() =>
+  settings.value.theme === "system" ? (systemDark.value ? "dark" : "light") : settings.value.theme,
+);
+watch(
+  [resolvedTheme, () => settings.value.skin],
+  ([theme, skin]) => {
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.dataset.skin = skin;
+  },
+  { immediate: true },
+);
+let unlistenMenu: UnlistenFn | null = null;
+let themeMedia: MediaQueryList | null = null;
+
+function openSettings(focus: "general" | "about" = "general") {
+  settingsFocus.value = focus;
+  settingsOpen.value = true;
+}
+
+async function saveAppSettings(next: AppSettings) {
+  try {
+    const file = await invoke<{ settings: AppSettings; path: string }>("save_settings", { settings: next });
+    settings.value = file.settings;
+    settingsPath.value = file.path;
+    settingsOpen.value = false;
+    if (presentSession.value) {
+      await invoke("set_present_nickname", { nickname: file.settings.nickname });
+    }
+  } catch (e) {
+    showError(e);
+  }
+}
+
+function nextDefaultName(base: string, taken: (name: string) => boolean) {
+  if (!taken(base)) return base;
+  let n = 2;
+  while (taken(`${base} ${n}`)) n += 1;
+  return `${base} ${n}`;
+}
+
+function onMenuAction(id: string) {
+  if (id === "settings" || id === "tray-settings") openSettings("general");
+  else if (id === "about" || id === "tray-about" || id === "about-help") openSettings("about");
+  else if (id === "new-note") void addNote();
+  else if (id === "new-folder") void addFolder();
+  else if (id === "import") void importBook();
+  else if (id === "export") void exportBook();
+}
 
 const selectedFolderId = ref<string | null>(null);
 const selectedNoteId = ref<string | null>(null);
@@ -93,6 +156,232 @@ function exitEditorFocusMode() {
 function toggleEditorFocusMode() {
   if (editorFocusMode.value) exitEditorFocusMode();
   else enterEditorFocusMode();
+}
+
+type PresentPeer = { ip: string; mode: string; color: string };
+type PresentSession = {
+  noteId: string;
+  title: string;
+  url: string;
+  ip: string;
+  port: number;
+  rev: number;
+  origin: string;
+  html: string;
+  maxEditors: number;
+  peers: PresentPeer[];
+  requests: { ip: string }[];
+  notices?: string[];
+};
+
+const PRESENT_MAX_KEY = "notebook.presentMaxEditors";
+function readPresentMax() {
+  const n = Number(localStorage.getItem(PRESENT_MAX_KEY) || "3");
+  if (!Number.isFinite(n)) return 3;
+  return Math.min(12, Math.max(1, Math.round(n)));
+}
+
+const historyOpen = ref(false);
+const presentOpen = ref(false);
+const presentMaxEditors = ref(readPresentMax());
+const presentSession = ref<PresentSession | null>(null);
+let presentPushTimer: ReturnType<typeof setTimeout> | null = null;
+let presentPollTimer: ReturnType<typeof setInterval> | null = null;
+let appliedPresentRev = -1;
+
+function openHistory() {
+  if (!selectedNoteId.value || sidebarNav.value === "trash") return;
+  historyOpen.value = true;
+}
+
+async function recordRevision(noteId: string) {
+  const title = noteTitleDraft.value.trim() || "未命名笔记";
+  await invoke("record_note_revision", {
+    noteId,
+    title,
+    contentHtml: editorHtml.value,
+  });
+}
+
+function stripCollabHtml(html: string) {
+  if (!html.includes("data-collab-ip")) return html;
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  doc.querySelectorAll("[data-collab-ip]").forEach((el) => {
+    const parent = el.parentNode;
+    if (!parent) return;
+    while (el.firstChild) parent.insertBefore(el.firstChild, el);
+    parent.removeChild(el);
+  });
+  return doc.body.innerHTML;
+}
+
+function holdEditorIgnore() {
+  editorIgnoreUpdates.value = true;
+  if (editorIgnoreTimer) clearTimeout(editorIgnoreTimer);
+  editorIgnoreTimer = setTimeout(() => {
+    editorIgnoreUpdates.value = false;
+    editorIgnoreTimer = null;
+  }, 220);
+}
+
+function schedulePresentPush() {
+  const session = presentSession.value;
+  if (!session || session.noteId !== selectedNoteId.value) return;
+  if (presentPushTimer) clearTimeout(presentPushTimer);
+  presentPushTimer = setTimeout(() => {
+    presentPushTimer = null;
+    const current = presentSession.value;
+    if (!current || current.noteId !== selectedNoteId.value) return;
+    const title = noteTitleDraft.value.trim() || current.title || "未命名笔记";
+    current.title = title;
+    void invoke("update_present", {
+      title,
+      html: editorHtml.value,
+    }).catch(() => {});
+  }, 280);
+}
+
+function startPresentPoll() {
+  if (presentPollTimer) return;
+  presentPollTimer = setInterval(() => {
+    void pullPresent();
+  }, 1200);
+}
+
+function stopPresentPoll() {
+  if (!presentPollTimer) return;
+  clearInterval(presentPollTimer);
+  presentPollTimer = null;
+}
+
+async function pullPresent() {
+  if (!presentSession.value) return;
+  try {
+    const snap = await invoke<PresentSession | null>("present_status");
+    if (!snap) {
+      presentSession.value = null;
+      presentOpen.value = false;
+      return;
+    }
+    const prevRev = appliedPresentRev;
+    presentSession.value = snap;
+    for (const text of snap.notices ?? []) showError(text);
+    if (snap.maxEditors) presentMaxEditors.value = snap.maxEditors;
+    if (snap.origin === "owner" || snap.rev === prevRev) {
+      appliedPresentRev = snap.rev;
+      return;
+    }
+    appliedPresentRev = snap.rev;
+    try {
+      await invoke("save_note_content", { noteId: snap.noteId, contentHtml: snap.html });
+      await invoke("record_note_revision", {
+        noteId: snap.noteId,
+        title: snap.title || "未命名笔记",
+        contentHtml: snap.html,
+      });
+    } catch (e) {
+      showError(e);
+    }
+    if (snap.noteId === selectedNoteId.value) {
+      holdEditorIgnore();
+      editorHtml.value = snap.html;
+      noteContentDirty.value = false;
+    }
+  } catch {
+    /* 演示进程已停 */
+  }
+}
+
+async function openPresent() {
+  const noteId = selectedNoteId.value;
+  if (!noteId || sidebarNav.value === "trash") return;
+  try {
+    const info = await invoke<PresentSession>("start_present", {
+      noteId,
+      title: noteTitleDraft.value.trim() || "未命名笔记",
+      html: editorHtml.value,
+      maxEditors: presentMaxEditors.value,
+    });
+    presentSession.value = info;
+    appliedPresentRev = info.rev ?? 0;
+    presentOpen.value = true;
+    startPresentPoll();
+    void invoke("set_present_nickname", { nickname: settings.value.nickname }).catch(() => {});
+  } catch (e) {
+    showError(e);
+  }
+}
+
+async function setPresentMax(n: number) {
+  const v = Math.min(12, Math.max(1, Math.round(n) || 1));
+  presentMaxEditors.value = v;
+  localStorage.setItem(PRESENT_MAX_KEY, String(v));
+  if (!presentSession.value) return;
+  try {
+    await invoke("set_present_max_editors", { maxEditors: v });
+  } catch (e) {
+    showError(e);
+  }
+}
+
+const pendingEditRequest = computed(() => presentSession.value?.requests?.[0] ?? null);
+
+async function revokeEdit(ip?: string) {
+  if (!presentSession.value) return;
+  try {
+    await invoke("present_revoke", { ip: ip ?? null });
+    await pullPresent();
+  } catch (e) {
+    showError(e);
+  }
+}
+
+async function decideEdit(allow: boolean) {
+  const ip = pendingEditRequest.value?.ip;
+  if (!ip) return;
+  try {
+    await invoke("present_decide", { ip, allow });
+    await pullPresent();
+  } catch (e) {
+    showError(e);
+  }
+}
+
+async function stopPresent() {
+  stopPresentPoll();
+  if (presentPushTimer) {
+    clearTimeout(presentPushTimer);
+    presentPushTimer = null;
+  }
+  const session = presentSession.value;
+  const noteId = session?.noteId && session.noteId === selectedNoteId.value ? selectedNoteId.value : session?.noteId;
+  const raw = noteId && noteId === selectedNoteId.value ? editorHtml.value : session?.html || "";
+  const stripped = stripCollabHtml(raw);
+  if (noteId && stripped !== raw) {
+    if (noteId === selectedNoteId.value) {
+      holdEditorIgnore();
+      editorHtml.value = stripped;
+      noteContentDirty.value = false;
+    }
+    try {
+      await invoke("save_note_content", { noteId, contentHtml: stripped });
+      await invoke("record_note_revision", {
+        noteId,
+        title: (noteId === selectedNoteId.value ? noteTitleDraft.value.trim() : session?.title) || "未命名笔记",
+        contentHtml: stripped,
+      });
+    } catch (e) {
+      showError(e);
+    }
+  }
+  try {
+    await invoke("stop_present");
+  } catch (e) {
+    showError(e);
+  }
+  presentSession.value = null;
+  presentOpen.value = false;
+  appliedPresentRev = -1;
 }
 
 const editorHtml = ref("<p></p>");
@@ -246,11 +535,20 @@ const displayedNotes = computed(() => {
 
   const preserveFolderOrder = sidebarNav.value === "folder" && !q;
   const preserveAllNotesOrder = sidebarNav.value === "all" && !q;
-  if (preserveFolderOrder || preserveAllNotesOrder) {
-    return out;
-  }
-  return sortNotesByMode(out, listSortMode.value);
+  const ordered = preserveFolderOrder || preserveAllNotesOrder ? out : sortNotesByMode(out, listSortMode.value);
+  return liftPinned(ordered);
 });
+
+function liftPinned(arr: NoteRow[]): NoteRow[] {
+  const pinned: NoteRow[] = [];
+  const rest: NoteRow[] = [];
+  for (const note of arr) {
+    if (note.isPinned) pinned.push(note);
+    else rest.push(note);
+  }
+  pinned.sort((a, b) => (b.pinnedAt || "").localeCompare(a.pinnedAt || ""));
+  return pinned.concat(rest);
+}
 
 const listPanelTitle = computed(() => {
   if (sidebarNav.value === "favorites") return "收藏";
@@ -296,6 +594,21 @@ const showNoteFolderTag = computed(
     !!searchQuery.value.trim(),
 );
 
+function noteById(noteId: string) {
+  return allNotes.value.find((n) => n.id === noteId) ?? notes.value.find((n) => n.id === noteId) ?? null;
+}
+
+async function toggleNotePinned(noteId: string) {
+  const n = noteById(noteId);
+  if (!n) return;
+  try {
+    await invoke<NoteRow>("set_note_pinned", { noteId, pinned: !n.isPinned });
+    await reloadAll();
+  } catch (e) {
+    showError(e);
+  }
+}
+
 async function toggleNoteFavorite(noteId: string) {
   const n = allNotes.value.find((x) => x.id === noteId);
   if (!n) return;
@@ -308,10 +621,116 @@ async function toggleNoteFavorite(noteId: string) {
   }
 }
 
-const FOLDER_DOT_COLORS = ["#3b82f6", "#64748b", "#ec4899", "#f59e0b", "#10b981"];
+const FOLDER_DOT_COLORS = ["#3b82f6", "#64748b", "#ec4899", "#f59e0b", "#10b981", "#7c3aed", "#ea580c", "#0f172a"];
 
-function folderDotColor(index: number): string {
-  return FOLDER_DOT_COLORS[index % FOLDER_DOT_COLORS.length] ?? "#3b82f6";
+function folderDotColor(folder: FolderRow, index: number): string {
+  return folder.color || FOLDER_DOT_COLORS[index % FOLDER_DOT_COLORS.length] || "#3b82f6";
+}
+
+const colorPick = ref<{ id: string; x: number; y: number } | null>(null);
+
+function openFolderColor(e: MouseEvent, id: string) {
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  colorPick.value = { id, x: rect.left, y: rect.bottom + 6 };
+}
+
+async function chooseFolderColor(color: string) {
+  const id = colorPick.value?.id;
+  colorPick.value = null;
+  if (!id) return;
+  try {
+    await invoke("set_folder_color", { id, color });
+    await reloadAll();
+  } catch (e) {
+    showError(e);
+  }
+}
+
+type FolderSlot = { kind: "folder"; folder: FolderRow } | { kind: "gap" };
+const ptrDragFolderId = ref<string | null>(null);
+const ptrFolderSlot = ref(0);
+const folderGhost = ref({ x: 0, y: 0, w: 180, name: "" });
+
+const folderSlots = computed((): FolderSlot[] => {
+  const full = folders.value;
+  const dragId = ptrDragFolderId.value;
+  if (!dragId) return full.map((folder) => ({ kind: "folder" as const, folder }));
+  const base = full.filter((folder) => folder.id !== dragId);
+  const slot = Math.min(Math.max(ptrFolderSlot.value, 0), base.length);
+  const out: FolderSlot[] = [];
+  for (let i = 0; i < base.length; i++) {
+    if (i === slot) out.push({ kind: "gap" });
+    out.push({ kind: "folder", folder: base[i]! });
+  }
+  if (slot === base.length) out.push({ kind: "gap" });
+  return out;
+});
+
+function recalcFolderSlot(clientY: number) {
+  const dragId = ptrDragFolderId.value;
+  if (!dragId) return;
+  const base = folders.value.filter((folder) => folder.id !== dragId);
+  let slot = base.length;
+  for (let i = 0; i < base.length; i++) {
+    const row = document.querySelector(`[data-folder-row="${CSS.escape(base[i]!.id)}"]`);
+    if (!(row instanceof HTMLElement)) continue;
+    const rect = row.getBoundingClientRect();
+    if (clientY < rect.top + rect.height / 2) {
+      slot = i;
+      break;
+    }
+  }
+  ptrFolderSlot.value = slot;
+}
+
+function onFolderPointerDown(e: PointerEvent, id: string) {
+  if (e.button !== 0) return;
+  const target = e.target instanceof Element ? e.target : null;
+  if (target?.closest(".folder-dot, .folder-dir-del")) return;
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const from = folders.value.findIndex((folder) => folder.id === id);
+  let started = false;
+  const move = (ev: PointerEvent) => {
+    if (!started) {
+      if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 5) return;
+      started = true;
+      ptrDragFolderId.value = id;
+      ptrFolderSlot.value = from < 0 ? 0 : from;
+      const row = (e.currentTarget as HTMLElement).closest(".folder-dir-item");
+      const rect = row instanceof HTMLElement ? row.getBoundingClientRect() : null;
+      folderGhost.value = {
+        x: ev.clientX - 20,
+        y: ev.clientY - 16,
+        w: rect ? Math.round(rect.width) : 180,
+        name: folders.value.find((folder) => folder.id === id)?.name ?? "",
+      };
+    }
+    folderGhost.value = { ...folderGhost.value, x: ev.clientX - 20, y: ev.clientY - 16 };
+    recalcFolderSlot(ev.clientY);
+  };
+  const up = async () => {
+    document.removeEventListener("pointermove", move);
+    document.removeEventListener("pointerup", up);
+    document.removeEventListener("pointercancel", up);
+    if (!started) return;
+    const dragId = ptrDragFolderId.value;
+    const slot = ptrFolderSlot.value;
+    const origin = folders.value.findIndex((folder) => folder.id === dragId);
+    ptrDragFolderId.value = null;
+    if (!dragId || slot === origin) return;
+    const base = folders.value.filter((folder) => folder.id !== dragId);
+    const before = slot < base.length ? base[slot]!.id : null;
+    try {
+      await invoke("place_folder", { folderId: dragId, beforeFolderId: before });
+      await reloadAll();
+    } catch (err) {
+      showError(err);
+    }
+  };
+  document.addEventListener("pointermove", move);
+  document.addEventListener("pointerup", up);
+  document.addEventListener("pointercancel", up);
 }
 
 function goAllNotes() {
@@ -454,16 +873,24 @@ async function addNoteInFolder(folderId: string) {
   closeContextMenu();
   selectFolder(folderId);
   await nextTick();
-  const title = await openTextPrompt({
-    title: "新建笔记",
-    placeholder: "笔记标题",
-    defaultValue: "未命名笔记",
-  });
-  if (!title?.trim()) return;
+  let title = "";
+  if (settings.value.useDefaultNames) {
+    title = nextDefaultName("未命名笔记", (name) =>
+      allNotes.value.some((note) => note.folderId === folderId && note.title.trim() === name),
+    );
+  } else {
+    const asked = await openTextPrompt({
+      title: "新建笔记",
+      placeholder: "笔记标题",
+      defaultValue: "未命名笔记",
+    });
+    if (!asked?.trim()) return;
+    title = asked.trim();
+  }
   try {
     const row = await invoke<NoteRow>("create_note", {
       folderId,
-      title: title.trim(),
+      title,
     });
     await reloadAll();
     selectedNoteId.value = row.id;
@@ -640,6 +1067,7 @@ function flushContentSave() {
         noteId: id,
         contentHtml: editorHtml.value,
       });
+      await recordRevision(id);
       noteContentDirty.value = false;
       await refreshAllNotes();
       await refreshNotesInFolder();
@@ -660,6 +1088,7 @@ function onEditorHtmlUpdate(v: string) {
   if (editorIgnoreUpdates.value) return;
   noteContentDirty.value = true;
   scheduleContentSave();
+  schedulePresentPush();
 }
 
 function flushTitleSave() {
@@ -671,6 +1100,7 @@ function flushTitleSave() {
   void (async () => {
     try {
       await invoke("rename_note", { id, title: t });
+      await recordRevision(id);
       noteTitleDirty.value = false;
       await refreshAllNotes();
       await refreshNotesInFolder();
@@ -689,6 +1119,7 @@ function scheduleTitleSave() {
 function onNoteTitleInput() {
   noteTitleDirty.value = true;
   scheduleTitleSave();
+  schedulePresentPush();
 }
 
 async function reloadAll() {
@@ -709,6 +1140,9 @@ async function reloadAll() {
 }
 
 function onGlobalMousedownFilter(e: MouseEvent) {
+  if (colorPick.value && e.target instanceof Element && !e.target.closest(".folder-color-pop, .folder-dot")) {
+    colorPick.value = null;
+  }
   if (!listFilterOpen.value) return;
   const root = listFilterRootRef.value;
   if (root && e.target instanceof Node && root.contains(e.target)) return;
@@ -717,11 +1151,39 @@ function onGlobalMousedownFilter(e: MouseEvent) {
 
 onMounted(() => {
   reloadAll();
+  themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
+  themeMedia.addEventListener("change", onSystemTheme);
+  void invoke<{ settings: AppSettings; path: string }>("get_settings")
+    .then((file) => {
+      settings.value = file.settings;
+      settingsPath.value = file.path;
+    })
+    .catch(() => {});
+  void listen<string>("nb-menu", (event) => onMenuAction(event.payload)).then((stop) => {
+    unlistenMenu = stop;
+  });
+  void invoke<PresentSession | null>("present_status")
+    .then((status) => {
+      if (!status) return;
+      presentSession.value = status;
+      appliedPresentRev = status.rev ?? 0;
+      if (status.maxEditors) presentMaxEditors.value = status.maxEditors;
+      startPresentPoll();
+    })
+    .catch(() => {});
   window.addEventListener("keydown", onGlobalKeydown);
   document.addEventListener("mousedown", onGlobalMousedownFilter, true);
 });
 
+function onSystemTheme() {
+  systemDark.value = themeMedia?.matches ?? false;
+}
+
 onUnmounted(() => {
+  themeMedia?.removeEventListener("change", onSystemTheme);
+  unlistenMenu?.();
+  unlistenMenu = null;
+  void stopPresent();
   document.removeEventListener("mousedown", onGlobalMousedownFilter, true);
   detachContextMenuListeners();
   if (editorIgnoreTimer) {
@@ -747,6 +1209,7 @@ function onGlobalKeydown(e: KeyboardEvent) {
 }
 
 watch(selectedNoteId, (id) => {
+  historyOpen.value = false;
   if (!id && editorFocusMode.value) exitEditorFocusMode();
 });
 
@@ -853,19 +1316,24 @@ function selectFolder(id: string) {
 }
 
 async function addFolder() {
-  const name = await openTextPrompt({
-    title: "新建文件夹",
-    placeholder: "文件夹名称",
-    defaultValue: "新建文件夹",
-  });
-  if (name == null || !name.trim()) return;
-  const trimmed = name.trim();
-  if (folders.value.some((f) => f.name.trim() === trimmed)) {
-    await message("已存在同名文件夹，请换一个名称。", {
-      title: "无法创建",
-      kind: "warning",
+  let trimmed = "";
+  if (settings.value.useDefaultNames) {
+    trimmed = nextDefaultName("新建文件夹", (name) => folders.value.some((f) => f.name.trim() === name));
+  } else {
+    const name = await openTextPrompt({
+      title: "新建文件夹",
+      placeholder: "文件夹名称",
+      defaultValue: "新建文件夹",
     });
-    return;
+    if (name == null || !name.trim()) return;
+    trimmed = name.trim();
+    if (folders.value.some((f) => f.name.trim() === trimmed)) {
+      await message("已存在同名文件夹，请换一个名称。", {
+        title: "无法创建",
+        kind: "warning",
+      });
+      return;
+    }
   }
   try {
     await invoke("create_folder", {
@@ -913,16 +1381,24 @@ async function addNote() {
     await message("请先创建一个文件夹。", { title: "提示", kind: "info" });
     return;
   }
-  const title = await openTextPrompt({
-    title: "新建笔记",
-    placeholder: "笔记标题",
-    defaultValue: "未命名笔记",
-  });
-  if (!title?.trim()) return;
+  let title = "";
+  if (settings.value.useDefaultNames) {
+    title = nextDefaultName("未命名笔记", (name) =>
+      allNotes.value.some((note) => note.folderId === targetFolder && note.title.trim() === name),
+    );
+  } else {
+    const asked = await openTextPrompt({
+      title: "新建笔记",
+      placeholder: "笔记标题",
+      defaultValue: "未命名笔记",
+    });
+    if (!asked?.trim()) return;
+    title = asked.trim();
+  }
   try {
     const n = await invoke<NoteRow>("create_note", {
       folderId: targetFolder,
-      title: title.trim(),
+      title,
     });
     await reloadAll();
     sidebarNav.value = "folder";
@@ -1325,7 +1801,12 @@ async function reorderNoteAppend(noteId: string) {
 </script>
 
 <template>
-  <div class="app-root" :class="{ 'note-pointer-dragging': ptrDragNoteId }">
+  <div
+    class="app-root"
+    :data-theme="resolvedTheme"
+    :data-skin="settings.skin"
+    :class="{ 'note-pointer-dragging': ptrDragNoteId || ptrDragFolderId }"
+  >
     <div
       class="app-columns"
       :class="{
@@ -1375,44 +1856,64 @@ async function reorderNoteAppend(noteId: string) {
           </span>
           <span class="nav-pill-label">废纸篓</span>
         </button>
+        <button type="button" class="nav-pill" title="软件设置" @click="openSettings('general')">
+          <span class="nav-pill-ic" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </span>
+          <span class="nav-pill-label">软件设置</span>
+        </button>
       </nav>
       <div class="col-nav-expandable">
       <div class="nav-section-label">自定义文件夹</div>
       <ul class="folder-dir" role="list">
         <li
-          v-for="(f, fi) in folders"
-          :key="f.id"
+          v-for="slot in folderSlots"
+          :key="slot.kind === 'gap' ? '__folder_gap__' : slot.folder.id"
           class="folder-dir-item"
-          :class="{
-            selected: sidebarNav === 'folder' && f.id === selectedFolderId,
-            'drag-target': dragOverFolderId === f.id,
-            'folder-select-anim': folderSelectAnimId === f.id,
-          }"
-          @contextmenu="openFolderContextMenu($event, f.id)"
+          :class="slot.kind === 'gap'
+            ? 'folder-row-gap'
+            : {
+                selected: sidebarNav === 'folder' && slot.folder.id === selectedFolderId,
+                'drag-target': dragOverFolderId === slot.folder.id,
+                'folder-select-anim': folderSelectAnimId === slot.folder.id,
+                'is-dragging': ptrDragFolderId === slot.folder.id,
+              }"
+          :data-folder-row="slot.kind === 'folder' ? slot.folder.id : undefined"
+          @contextmenu="slot.kind === 'folder' && openFolderContextMenu($event, slot.folder.id)"
+          @pointerdown="slot.kind === 'folder' && onFolderPointerDown($event, slot.folder.id)"
         >
-          <button
-            type="button"
-            class="folder-dir-hit"
-            :title="f.name"
-            :data-folder-drop-id="f.id"
-            @click="selectFolder(f.id)"
-          >
-            <span
-              class="folder-dot"
-              :style="{ background: folderDotColor(fi) }"
-              aria-hidden="true"
-            />
-            <span class="folder-dir-name">{{ f.name }}</span>
-          </button>
-          <button
-            type="button"
-            class="folder-dir-del"
-            title="删除文件夹"
-            aria-label="删除文件夹"
-            @click.stop="removeFolder(f.id)"
-          >
-            ×
-          </button>
+          <template v-if="slot.kind === 'gap'">
+            <span class="folder-row-gap-label">放在此处</span>
+          </template>
+          <template v-else>
+            <button
+              type="button"
+              class="folder-dir-hit"
+              :title="slot.folder.name"
+              :data-folder-drop-id="slot.folder.id"
+              @click="selectFolder(slot.folder.id)"
+            >
+              <span
+                class="folder-dot"
+                :style="{ background: folderDotColor(slot.folder, folders.findIndex((item) => item.id === slot.folder.id)) }"
+                role="button"
+                tabindex="0"
+                title="选择颜色"
+                @click.stop="openFolderColor($event, slot.folder.id)"
+                @keydown.enter.stop.prevent="openFolderColor($event as unknown as MouseEvent, slot.folder.id)"
+              />
+              <span class="folder-dir-name">{{ slot.folder.name }}</span>
+            </button>
+            <button
+              type="button"
+              class="folder-dir-del"
+              title="删除文件夹"
+              aria-label="删除文件夹"
+              @click.stop="removeFolder(slot.folder.id)"
+            >
+              ×
+            </button>
+          </template>
         </li>
       </ul>
       </div>
@@ -1423,6 +1924,7 @@ async function reorderNoteAppend(noteId: string) {
           <button type="button" class="linkish" @click="importBook">导入 .tbook</button>
           <button type="button" class="linkish" @click="exportBook">导出 .tbook</button>
         </div>
+        <p class="nav-version">NoteBook v{{ APP_DISPLAY_VERSION }}</p>
       </div>
       <button
         v-if="navCollapsed"
@@ -1550,6 +2052,7 @@ async function reorderNoteAppend(noteId: string) {
             </button>
             <div class="note-main">
               <div class="note-title-line">
+                <span v-if="slot.note.isPinned" class="note-pin-tag">置顶</span>
                 <span class="note-title">{{ slot.note.title }}</span>
               </div>
               <p class="note-preview">
@@ -1561,6 +2064,19 @@ async function reorderNoteAppend(noteId: string) {
             </div>
             <div class="note-aside">
               <span class="note-time">{{ formatListTime(slot.note.updatedAt) }}</span>
+              <button
+                type="button"
+                class="note-fav"
+                :class="{ 'note-pin--on': slot.note.isPinned }"
+                :title="slot.note.isPinned ? '取消置顶' : '置顶'"
+                :aria-pressed="slot.note.isPinned"
+                aria-label="置顶"
+                @click.stop="toggleNotePinned(slot.note.id)"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M9 4h6l-1 7h4l-6 9-6-9h4L9 4z" />
+                </svg>
+              </button>
               <button
                 type="button"
                 class="note-fav"
@@ -1647,6 +2163,35 @@ async function reorderNoteAppend(noteId: string) {
             placeholder="笔记标题"
             @input="onNoteTitleInput"
           />
+          <div class="main-title-actions">
+          <button
+            type="button"
+            class="main-title-focus"
+            :class="{ 'main-title-focus--on': presentSession?.noteId === selectedNoteId }"
+            :title="presentSession ? `实时演示，${presentSession.peers?.length || 0} 人在线` : '实时演示'"
+            aria-label="实时演示"
+            @click="openPresent"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 5h16v10H4z" />
+              <path d="M8 19h8" />
+              <path d="M12 15v4" />
+            </svg>
+            <span v-if="presentSession" class="present-count">{{ presentSession.peers?.length || 0 }}</span>
+          </button>
+          <button
+            type="button"
+            class="main-title-focus"
+            :class="{ 'main-title-focus--on': historyOpen }"
+            title="历史版本"
+            aria-label="历史版本"
+            @click="openHistory"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="8" />
+              <path d="M12 8v5l3 2" />
+            </svg>
+          </button>
           <button
             type="button"
             class="main-title-focus"
@@ -1685,6 +2230,7 @@ async function reorderNoteAppend(noteId: string) {
               <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
             </svg>
           </button>
+          </div>
         </div>
         <div v-else class="main-title-placeholder">选择一条笔记开始编辑</div>
       </header>
@@ -1699,6 +2245,64 @@ async function reorderNoteAppend(noteId: string) {
     </div>
 
     <div v-if="errorMsg" class="toast">{{ errorMsg }}</div>
+    <HistoryDrawer :open="historyOpen" :note-id="selectedNoteId" @close="historyOpen = false" />
+    <PresentPanel
+      :open="presentOpen"
+      :session="presentSession"
+      :max-editors="presentMaxEditors"
+      @close="presentOpen = false"
+      @stop="stopPresent"
+      @set-max="setPresentMax"
+      @revoke="revokeEdit()"
+      @revoke-ip="revokeEdit"
+    />
+    <SettingsDialog
+      :open="settingsOpen"
+      :settings="settings"
+      :path="settingsPath"
+      :focus="settingsFocus"
+      @close="settingsOpen = false"
+      @save="saveAppSettings"
+    />
+    <Teleport to="body">
+      <div
+        v-if="colorPick"
+        class="folder-color-pop"
+        :style="{ left: colorPick.x + 'px', top: colorPick.y + 'px' }"
+      >
+        <button
+          v-for="color in FOLDER_DOT_COLORS"
+          :key="color"
+          type="button"
+          class="folder-color-swatch"
+          :style="{ background: color }"
+          :aria-label="color"
+          @click="chooseFolderColor(color)"
+        />
+      </div>
+      <div
+        v-if="ptrDragFolderId"
+        class="folder-drag-ghost"
+        :style="{ width: folderGhost.w + 'px', transform: `translate(${folderGhost.x}px, ${folderGhost.y}px)` }"
+      >
+        {{ folderGhost.name }}
+      </div>
+    </Teleport>
+    <Teleport to="body">
+      <div v-if="pendingEditRequest" class="edit-ask">
+        <section class="edit-ask-card" role="dialog" aria-label="编辑权限申请">
+          <h3>编辑权限申请</h3>
+          <p>{{ pendingEditRequest.ip }} 申请该笔记的编辑权限</p>
+          <p v-if="(presentSession?.requests.length || 0) > 1" class="edit-ask-more">
+            还有 {{ (presentSession?.requests.length || 1) - 1 }} 条申请在排队
+          </p>
+          <div class="edit-ask-actions">
+            <button type="button" class="edit-ask-yes" @click="decideEdit(true)">同意</button>
+            <button type="button" class="edit-ask-no" @click="decideEdit(false)">拒绝</button>
+          </div>
+        </section>
+      </div>
+    </Teleport>
 
     <Teleport to="body">
       <div
@@ -1756,6 +2360,14 @@ async function reorderNoteAppend(noteId: string) {
             @click="openNoteFromCtx(contextMenu.noteId)"
           >
             打开笔记
+          </button>
+          <button
+            type="button"
+            class="ctx-item"
+            role="menuitem"
+            @click="toggleNotePinned(contextMenu.noteId); closeContextMenu()"
+          >
+            {{ noteById(contextMenu.noteId)?.isPinned ? "取消置顶" : "置顶" }}
           </button>
           <button
             type="button"
@@ -1853,16 +2465,6 @@ async function reorderNoteAppend(noteId: string) {
 .app-root {
   --overlay-titlebar-h: 38px;
   --overlay-traffic-safe-left: 76px;
-  --bg-side: #f5f7fa;
-  --bg-middle: #e1e8f2;
-  --bg: #ffffff;
-  --line: #e5e7eb;
-  --text: #111827;
-  --muted: #6b7280;
-  --accent: #2563eb;
-  --accent-soft: #dbeafe;
-  --accent-strong: #1d4ed8;
-  --accent-sidebar-active: #e8f1fe;
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
@@ -1875,19 +2477,7 @@ async function reorderNoteAppend(noteId: string) {
   margin: 0;
   overflow: hidden;
   color: var(--text);
-  font-family:
-    ui-sans-serif,
-    system-ui,
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    Roboto,
-    "Helvetica Neue",
-    Arial,
-    "PingFang SC",
-    "Hiragino Sans GB",
-    "Microsoft YaHei",
-    sans-serif;
+  font-family: var(--font);
   font-size: 14px;
 }
 
@@ -1978,8 +2568,8 @@ async function reorderNoteAppend(noteId: string) {
 
 .col-splitter-btn:hover {
   color: var(--accent);
-  border-color: #b8c9e8;
-  background: #fff;
+  border-color: var(--accent);
+  background: var(--surface);
   box-shadow:
     0 2px 8px rgba(37, 99, 235, 0.12),
     0 6px 18px rgba(15, 23, 42, 0.08);
@@ -2191,7 +2781,7 @@ async function reorderNoteAppend(noteId: string) {
   flex-direction: column;
   min-height: 0;
   box-sizing: border-box;
-  border-right: 1px solid #cdd6e4;
+  border-right: 1px solid var(--line);
   transition:
     opacity calc(var(--col-dur) * 0.7) var(--col-ease),
     transform calc(var(--col-dur) * 0.85) var(--col-ease);
@@ -2252,7 +2842,7 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .nav-pill:hover {
-  background: rgba(255, 255, 255, 0.75);
+  background: var(--wash);
 }
 
 .nav-pill.active {
@@ -2276,7 +2866,7 @@ async function reorderNoteAppend(noteId: string) {
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: #9ca3af;
+  color: var(--muted);
   padding: 8px 8px 4px;
 }
 
@@ -2304,12 +2894,12 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .folder-dir-item:not(.selected):hover {
-  background: rgba(255, 255, 255, 0.72);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  background: var(--wash);
+  box-shadow: none;
 }
 
 .folder-dir-item.selected {
-  background: #fff;
+  background: var(--accent-sidebar-active);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
 }
 
@@ -2375,11 +2965,30 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .folder-dot {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
   flex-shrink: 0;
   box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+}
+.folder-row-gap {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  margin: 2px 8px;
+  border: 2px dashed rgba(37, 99, 235, 0.42);
+  border-radius: 10px;
+  background: rgba(37, 99, 235, 0.06);
+  color: rgba(37, 99, 235, 0.85);
+  font-size: 12px;
+}
+.folder-dir-item.is-dragging { opacity: 0.35; }
+.nav-version {
+  margin: 2px 2px 0;
+  font-size: 12px;
+  color: var(--muted);
 }
 
 .folder-dir-name {
@@ -2524,14 +3133,14 @@ async function reorderNoteAppend(noteId: string) {
   padding: 0 12px;
   height: 40px;
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.88);
-  border: 1px solid #c5d0e0;
+  background: var(--field);
+  border: 1px solid var(--field-line);
   box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
 }
 
 .list-search-ic {
   display: flex;
-  color: #9ca3af;
+  color: var(--muted);
   flex-shrink: 0;
 }
 
@@ -2547,7 +3156,7 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .list-search-input::placeholder {
-  color: #9ca3af;
+  color: var(--muted);
 }
 
 .list-empty-hint {
@@ -2583,8 +3192,9 @@ async function reorderNoteAppend(noteId: string) {
   cursor: pointer;
   position: relative;
   border-radius: 14px;
-  border: 1px solid rgba(197, 208, 224, 0.95);
-  background: rgba(255, 255, 255, 0.58);
+  border: 1px solid var(--card-line);
+  background: var(--card);
+  color: var(--text);
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
   transition:
     background 0.15s ease,
@@ -2593,14 +3203,14 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .note-row:hover {
-  background: rgba(255, 255, 255, 0.92);
-  border-color: #b8c8dc;
+  background: var(--card-hover);
+  border-color: var(--card-line);
   box-shadow: 0 2px 10px rgba(15, 23, 42, 0.07);
 }
 
 .note-row.active {
-  background: #fff;
-  border-color: #9eb4d0;
+  background: var(--card-active);
+  border-color: var(--accent);
   box-shadow:
     0 1px 3px rgba(15, 23, 42, 0.06),
     0 6px 22px rgba(15, 23, 42, 0.1);
@@ -2667,6 +3277,7 @@ async function reorderNoteAppend(noteId: string) {
 .note-title {
   font-weight: 700;
   font-size: 14px;
+  color: var(--text);
   flex: 1;
   min-width: 0;
   overflow: hidden;
@@ -2696,7 +3307,7 @@ async function reorderNoteAppend(noteId: string) {
 .note-word-stat {
   font-size: 10px;
   font-weight: 600;
-  color: #9ca3af;
+  color: var(--muted);
   line-height: 1.2;
   white-space: nowrap;
 }
@@ -2745,8 +3356,25 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .note-row:hover .note-fav,
-.note-fav--on {
+.note-fav--on,
+.note-pin--on {
   opacity: 1;
+}
+
+.note-pin--on {
+  color: #1d4ed8;
+}
+
+.note-pin-tag {
+  flex-shrink: 0;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
 }
 
 .note-fav--on {
@@ -2824,6 +3452,40 @@ async function reorderNoteAppend(noteId: string) {
   }
 }
 
+.folder-color-pop {
+  position: fixed;
+  z-index: 100001;
+  display: grid;
+  grid-template-columns: repeat(4, 22px);
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--bg, #fff);
+  border: 1px solid var(--line, #e5e7eb);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.16);
+}
+.folder-color-swatch {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 99px;
+  cursor: pointer;
+  padding: 0;
+}
+.folder-drag-ghost {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 100002;
+  pointer-events: none;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--bg, #fff);
+  color: var(--text, #111827);
+  border: 1px solid var(--line, #e5e7eb);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.16);
+  font-size: 13px;
+}
 .note-drag-ghost {
   position: fixed;
   left: 0;
@@ -2833,8 +3495,9 @@ async function reorderNoteAppend(noteId: string) {
   box-sizing: border-box;
   padding: 12px 14px;
   border-radius: 14px;
-  background: #fff;
-  border: 1px solid #b8c5d8;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--card-line);
   box-shadow:
     0 12px 40px rgba(15, 23, 42, 0.18),
     0 4px 12px rgba(37, 99, 235, 0.1);
@@ -2885,7 +3548,7 @@ async function reorderNoteAppend(noteId: string) {
 .main-title-bar {
   padding: 10px 28px 8px;
   flex-shrink: 0;
-  background: #fff;
+  background: var(--paper);
 }
 
 .main-title-row {
@@ -2895,12 +3558,20 @@ async function reorderNoteAppend(noteId: string) {
   width: 100%;
 }
 
-.main-title-focus {
-  flex-shrink: 0;
+.main-title-actions {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.main-title-focus {
+  position: relative;
+  flex-shrink: 0;
   align-self: center;
   border: 1px solid var(--line);
-  background: #f8fafc;
+  background: var(--chip);
   cursor: pointer;
   padding: 8px;
   margin-top: 2px;
@@ -2917,14 +3588,94 @@ async function reorderNoteAppend(noteId: string) {
 
 .main-title-focus:hover {
   color: var(--accent);
-  border-color: #b8c9e8;
-  background: #fff;
+  border-color: var(--accent);
+  background: var(--card-hover);
 }
 
 .main-title-focus--on {
   color: var(--accent);
   border-color: var(--accent-soft);
   background: var(--accent-sidebar-active);
+}
+
+.present-count {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 99px;
+  background: #1d4ed8;
+  color: #fff;
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.edit-ask {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  background: rgba(15, 23, 42, 0.28);
+  font-family: var(--font);
+}
+
+.edit-ask-card {
+  width: min(420px, calc(100vw - 48px));
+  padding: 22px 22px 18px;
+  border-radius: 16px;
+  background: var(--surface);
+  color: var(--surface-text);
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.22);
+}
+
+.edit-ask-card h3 {
+  margin: 0 0 8px;
+  font-size: 18px;
+}
+
+.edit-ask-card p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--surface-muted);
+}
+
+.edit-ask-more {
+  margin-top: 6px !important;
+  color: #6b7280 !important;
+  font-size: 12px !important;
+}
+
+.edit-ask-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.edit-ask-yes,
+.edit-ask-no {
+  height: 36px;
+  padding: 0 16px;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+}
+
+.edit-ask-yes {
+  background: #1d4ed8;
+  color: #fff;
+}
+
+.edit-ask-no {
+  background: var(--chip);
+  color: var(--chip-text);
 }
 
 @supports (-webkit-touch-callout: none) {
@@ -2977,7 +3728,7 @@ async function reorderNoteAppend(noteId: string) {
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
-  background: #fafbfc;
+  background: var(--paper);
 }
 
 .editor-shell--trash {
@@ -3013,7 +3764,8 @@ async function reorderNoteAppend(noteId: string) {
 .modal-panel {
   width: 100%;
   max-width: 400px;
-  background: #fff;
+  background: var(--surface);
+  color: var(--surface-text);
   border-radius: 12px;
   padding: 18px 18px 14px;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
@@ -3029,6 +3781,8 @@ async function reorderNoteAppend(noteId: string) {
   width: 100%;
   box-sizing: border-box;
   border: 1px solid var(--line);
+  background: var(--field);
+  color: var(--text);
   border-radius: 8px;
   padding: 10px 12px;
   font-size: 14px;
@@ -3057,8 +3811,8 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .modal-btn.secondary {
-  background: #f0f2f5;
-  color: var(--text);
+  background: var(--chip);
+  color: var(--chip-text);
 }
 
 .modal-btn.primary {
@@ -3068,9 +3822,9 @@ async function reorderNoteAppend(noteId: string) {
 }
 
 .ctx-menu {
-  --ctx-line: #e8eaed;
-  --ctx-text: #1a1a1a;
-  --ctx-muted: #8a8f98;
+  --ctx-line: var(--line);
+  --ctx-text: var(--surface-text);
+  --ctx-muted: var(--surface-muted);
   position: fixed;
   z-index: 10000;
   min-width: 200px;
@@ -3078,23 +3832,13 @@ async function reorderNoteAppend(noteId: string) {
   padding: 6px 0;
   margin: 0;
   list-style: none;
-  background: #fff;
+  background: var(--surface);
   border-radius: 10px;
   box-shadow:
     0 4px 24px rgba(0, 0, 0, 0.12),
     0 0 1px rgba(0, 0, 0, 0.08);
   border: 1px solid var(--ctx-line);
-  font-family:
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    Roboto,
-    "Helvetica Neue",
-    Arial,
-    "PingFang SC",
-    "Hiragino Sans GB",
-    "Microsoft YaHei",
-    sans-serif;
+  font-family: var(--font);
   font-size: 15px;
   line-height: 1.6;
   font-weight: 400;
@@ -3160,7 +3904,7 @@ async function reorderNoteAppend(noteId: string) {
   overflow-y: auto;
   list-style: none;
   margin: 0;
-  background: #fff;
+  background: var(--surface);
   border-radius: 10px;
   box-shadow:
     0 4px 24px rgba(0, 0, 0, 0.12),
@@ -3203,26 +3947,95 @@ async function reorderNoteAppend(noteId: string) {
 </style>
 
 <style>
-/* 与 tauri.conf.json 中 backgroundColor、侧栏 --bg-side 一致 */
 html {
   margin: 0;
   min-height: 100%;
   height: 100%;
-  background: #f5f7fa;
+  color-scheme: light;
+  --font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-family: var(--font);
+  --bg-side: #f5f7fa;
+  --bg-middle: #e8eef6;
+  --bg: #ffffff;
+  --line: #e5e7eb;
+  --text: #111827;
+  --muted: #6b7280;
+  --accent: #2563eb;
+  --accent-soft: #dbeafe;
+  --accent-strong: #1d4ed8;
+  --accent-sidebar-active: #e8f1fe;
+  --card: #ffffff;
+  --card-hover: #f8fafc;
+  --card-active: #ffffff;
+  --card-line: #d5deea;
+  --field: #ffffff;
+  --field-line: #c5d0e0;
+  --paper: #fafbfc;
+  --toolbar: #ffffff;
+  --chip: #f0f2f5;
+  --chip-hover: #e4e6ea;
+  --chip-text: #1f2937;
+  --wash: rgba(15, 23, 42, 0.05);
+  --surface: #ffffff;
+  --surface-text: #111827;
+  --surface-muted: #6b7280;
+  --code-bg: #f3f4f6;
+  --quote: #4b5563;
+  --quote-bar: #c5cad3;
+  background: var(--bg-side);
 }
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-side: #0e1420;
+  --bg-middle: #121926;
+  --bg: #171f2e;
+  --line: #2a3548;
+  --text: #e8eef7;
+  --muted: #9aa8bd;
+  --accent-soft: #1e3a5f;
+  --accent-sidebar-active: #1a2c4d;
+  --card: #1c2636;
+  --card-hover: #243044;
+  --card-active: #1d2d48;
+  --card-line: #334158;
+  --field: #1a2433;
+  --field-line: #3a4a62;
+  --paper: #171f2e;
+  --toolbar: #141c2b;
+  --chip: #243044;
+  --chip-hover: #2d3c54;
+  --chip-text: #e8eef7;
+  --wash: rgba(255, 255, 255, 0.06);
+  --surface: #1c2636;
+  --surface-text: #e8eef7;
+  --surface-muted: #9aa8bd;
+  --code-bg: #243044;
+  --quote: #c5d0e0;
+  --quote-bar: #4b5d78;
+}
+html[data-skin="green"] { --accent: #059669; --accent-strong: #047857; --accent-soft: #d1fae5; --accent-sidebar-active: #ecfdf5; }
+html[data-skin="violet"] { --accent: #7c3aed; --accent-strong: #6d28d9; --accent-soft: #ede9fe; --accent-sidebar-active: #f5f3ff; }
+html[data-skin="amber"] { --accent: #d97706; --accent-strong: #b45309; --accent-soft: #fef3c7; --accent-sidebar-active: #fffbeb; }
+html[data-skin="slate"] { --accent: #475569; --accent-strong: #334155; --accent-soft: #e2e8f0; --accent-sidebar-active: #f1f5f9; }
+html[data-theme="dark"][data-skin="blue"] { --accent-soft: #16325c; --accent-sidebar-active: #1a3058; }
+html[data-theme="dark"][data-skin="green"] { --accent: #34d399; --accent-strong: #6ee7b7; --accent-soft: #064e3b; --accent-sidebar-active: #0b3b2e; }
+html[data-theme="dark"][data-skin="violet"] { --accent: #a78bfa; --accent-strong: #c4b5fd; --accent-soft: #3b2670; --accent-sidebar-active: #2e1b55; }
+html[data-theme="dark"][data-skin="amber"] { --accent: #fbbf24; --accent-strong: #fcd34d; --accent-soft: #5c3b10; --accent-sidebar-active: #4a2e0c; }
+html[data-theme="dark"][data-skin="slate"] { --accent: #cbd5e1; --accent-strong: #e2e8f0; --accent-soft: #334155; --accent-sidebar-active: #1e293b; }
 
 body {
   margin: 0;
   min-height: 100%;
   height: 100%;
-  background: #f5f7fa;
+  background: var(--bg-side);
+  color: var(--text);
 }
 
 #app {
   margin: 0;
   min-height: 100%;
   height: 100%;
-  background: #f5f7fa;
+  background: var(--bg-side);
   display: flex;
   flex-direction: column;
   align-items: stretch;
